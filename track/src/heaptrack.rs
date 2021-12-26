@@ -1,95 +1,99 @@
-use libc::{backtrace, c_void};
-use std::io::Write;
-use std::mem::ManuallyDrop;
-use std::time::Instant;
+use crate::HeaptrackGatherHandle;
+use std::sync::{Arc, Mutex};
 
 use crate::trace::{Trace, TraceTree};
 
-pub struct HeaptrackWriter<W> {
-    inner: LineWriter<W>,
-    start_time: Instant,
-    trace_tree: TraceTree,
-    module_cache_dirty: bool,
+#[derive(Debug)]
+pub enum TraceInstruction {
+    Init(TraceInstructionInit),
+    Stack(TraceInstructionStack),
+    Allocate(TraceInstructionAllocate),
+    Free(TraceInstructionFree),
 }
 
-impl<W: Write> HeaptrackWriter<W> {
-    const VERSION: usize = 0x10350;
-    const FILE_FORMAT_VERSION: usize = 3;
+#[derive(Debug)]
+pub struct TraceInstructionInit {
+    pub thread_name: String,
+}
 
-    pub fn new(inner: W, start_time: Instant) -> Self {
+#[derive(Debug)]
+pub struct TraceInstructionStack {
+    pub name: String,
+    pub parent: usize,
+}
+
+#[derive(Debug)]
+pub struct TraceInstructionAllocate {
+    pub size: usize,
+    pub ptr: u64,
+    pub trace_index: usize,
+}
+
+#[derive(Debug)]
+pub struct TraceInstructionFree {
+    pub ptr: u64,
+}
+
+pub struct HeaptrackWriter {
+    trace_tree: TraceTree,
+    trace_buffer: TraceBuffer,
+}
+
+struct TraceBuffer {
+    handle: HeaptrackGatherHandle,
+    buffer: Arc<Mutex<Vec<TraceInstruction>>>,
+}
+
+impl TraceBuffer {
+    fn new(handle: HeaptrackGatherHandle) -> Self {
         Self {
-            inner: LineWriter {
-                writer: inner.into(),
-            },
-            start_time,
+            handle,
+            buffer: Default::default(),
+        }
+    }
+
+    fn init(&mut self) {
+        self.handle.register(self.buffer.clone());
+        // self.trace(TraceInstruction::Init(TraceInstructionInit {
+        //     thread_name: std::thread::current()
+        //         .name()
+        //         .map_or_else(|| "unknown".to_owned(), |name| name.to_owned()),
+        // }))
+    }
+
+    fn trace(&mut self, instruction: TraceInstruction) {
+        let mut buffer = self.buffer.lock().unwrap();
+        if buffer.capacity() < 1024 {
+            let to_reserve = 1024 - buffer.capacity();
+            buffer.reserve(to_reserve);
+        }
+        buffer.push(instruction);
+        if buffer.len() == buffer.capacity() {
+            let buffer = std::mem::take(&mut *buffer);
+            self.handle.flush(buffer);
+        }
+    }
+}
+
+impl HeaptrackWriter {
+    pub fn new(handle: HeaptrackGatherHandle) -> Self {
+        Self {
             trace_tree: Default::default(),
-            module_cache_dirty: true,
+            trace_buffer: TraceBuffer::new(handle),
         }
     }
 
     pub fn init(&mut self) {
-        self.write_version();
-        self.write_exe();
-        self.write_command_line();
-        self.write_system_info();
-        self.write_suppressions();
+        self.trace_buffer.init();
     }
 
-    fn write_version(&mut self) {
-        self.inner
-            .write_hex_line('v', &[Self::VERSION, Self::FILE_FORMAT_VERSION])
-            .expect("write failed")
-    }
-
-    fn write_exe(&mut self) {
-        let buf = std::fs::read_link("/proc/self/exe").expect("read_link failed");
-        let exe = buf.to_string_lossy();
-        write!(self.inner.writer, "x {:x} {}\0\n", exe.len(), exe).expect("write failed");
-    }
-
-    fn write_command_line(&mut self) {
-        let cmd_line = std::fs::read("/proc/self/cmdline").expect("read failed");
-        let mut slice = &cmd_line[..];
-        write!(self.inner.writer, "X").expect("write failed");
-        while slice.len() > 1 {
-            let end = slice
-                .iter()
-                .position(|x| *x == 0)
-                .unwrap_or_else(|| slice.len());
-            write!(self.inner.writer, " ").expect("write failed");
-            self.inner
-                .writer
-                .write_all(&slice[..end])
-                .expect("write_all failed");
-            slice = &slice[end..];
-        }
-        write!(self.inner.writer, "\n").expect("write failed");
-    }
-
-    fn write_system_info(&mut self) {
-        // I _SC_PAGESIZE _SC_PHYS_PAGES
-        self.inner
-            .write_hex_line('I', &[4096, 1])
-            .expect("write failed");
-    }
-
-    fn write_suppressions(&mut self) {
-        // Not yet implemented
-    }
-
-    fn write_timestamp(&mut self) {
-        self.inner
-            .write_hex_line('c', &[self.start_time.elapsed().as_millis() as usize])
-            .expect("write failed")
+    fn _write_timestamp(&mut self) {
+        // TODO
     }
 
     pub fn handle_malloc(&mut self, ptr: *mut u8, size: usize, trace: &Trace) {
-        self.update_module_cache();
-        let inner = &mut self.inner;
-        let index = self.trace_tree.index(trace, move |ip, index| {
-            inner
-                .write_hex_line('t', &[ip as usize - 1, index as _])
-                .expect("write failed");
+        let trace_buffer = &mut self.trace_buffer;
+        let index = self.trace_tree.index(trace, |ip, index| {
             let mut symbol = None;
             {
                 let symbol = &mut symbol;
@@ -97,91 +101,25 @@ impl<W: Write> HeaptrackWriter<W> {
                     *symbol = sym.name().map(|name| format!("{:#}", name));
                 });
             }
-            if let Some(symbol) = symbol {
-                write!(inner.writer, "# {}\n", symbol);
-            }
+            let symbol = symbol.unwrap_or_else(|| "<unresolved>".to_owned());
+            trace_buffer.trace(TraceInstruction::Stack(TraceInstructionStack {
+                name: symbol,
+                parent: index as _,
+            }));
             true
         });
-        self.inner
-            .write_hex_line('+', &[size as _, index as _, ptr as _])
-            .expect("write failed");
+        self.trace_buffer
+            .trace(TraceInstruction::Allocate(TraceInstructionAllocate {
+                trace_index: index as _,
+                ptr: ptr as _,
+                size,
+            }))
     }
 
     pub fn handle_free(&mut self, ptr: *mut u8) {
-        self.inner
-            .write_hex_line('-', &[ptr as _])
-            .expect("write failed");
-    }
-
-    fn update_module_cache(&mut self) {
-        if self.module_cache_dirty {
-            self.module_cache_dirty = false;
-            self.inner
-                .writer
-                .write_all(b"m 1 -\n")
-                .expect("write_all failed");
-
-            unsafe extern "C" fn dl_iterate_phdr_callback(
-                info: *mut libc::dl_phdr_info,
-                _size: libc::size_t,
-                data: *mut c_void,
-            ) -> libc::c_int {
-                let writer: Box<Box<&mut dyn Write>> = Box::from_raw(data as _);
-                let mut writer = ManuallyDrop::new(writer);
-
-                let filename = if (*info).dlpi_name.is_null() {
-                    "x".to_owned()
-                } else {
-                    let cstr = std::ffi::CStr::from_ptr((*info).dlpi_name);
-                    let bytes = cstr.to_bytes();
-                    if bytes.len() == 0 {
-                        "x".to_owned()
-                    } else {
-                        String::from(cstr.to_string_lossy())
-                    }
-                };
-
-                write!(
-                    writer,
-                    "m {:x} {} {:x}",
-                    filename.len(),
-                    filename,
-                    (*info).dlpi_addr as u64
-                )
-                .expect("write failed");
-                let phdrs = std::slice::from_raw_parts((*info).dlpi_phdr, (*info).dlpi_phnum as _);
-                for phdr in phdrs {
-                    if phdr.p_type == libc::PT_LOAD {
-                        write!(writer, " {:x} {:x}", phdr.p_vaddr, phdr.p_memsz)
-                            .expect("write failed");
-                    }
-                }
-                write!(writer, "\n").expect("write failed");
-
-                0
-            }
-
-            let writer = Box::new(Box::new(&mut self.inner.writer as &mut dyn Write));
-            let data = Box::into_raw(writer);
-            unsafe {
-                libc::dl_iterate_phdr(Some(dl_iterate_phdr_callback), data as _);
-                let _ = Box::from_raw(data);
-            }
-        }
-    }
-}
-
-struct LineWriter<W> {
-    writer: Box<W>,
-}
-
-impl<W: Write> LineWriter<W> {
-    fn write_hex_line(&mut self, type_char: char, numbers: &[usize]) -> std::io::Result<()> {
-        write!(self.writer, "{}", type_char)?;
-        for number in numbers {
-            write!(self.writer, " {:x}", number)?;
-        }
-        write!(self.writer, "\n")?;
-        Ok(())
+        self.trace_buffer
+            .trace(TraceInstruction::Free(TraceInstructionFree {
+                ptr: ptr as _,
+            }))
     }
 }
