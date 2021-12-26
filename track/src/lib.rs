@@ -1,9 +1,5 @@
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::borrow::BorrowMut;
 use std::cell::RefCell;
-use std::io::Write;
-use std::mem::ManuallyDrop;
-use std::ops::DerefMut;
 use std::path::Path;
 use std::time::Instant;
 
@@ -56,7 +52,7 @@ impl HeaptrackInner {
 unsafe impl GlobalAlloc for HeaptrackAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = System.alloc(layout);
-        let trace = Trace::new();
+        let trace = Trace::new(Self::alloc as _);
         HeaptrackInner::writer(|writer| {
             dbg!(&ptr);
             writer.handle_malloc(ptr, layout.size(), &trace)

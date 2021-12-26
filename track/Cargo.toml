@@ -9,4 +9,4 @@ edition = "2021"
 
 [dependencies]
 libc = "0.2"
-libunwind-sys = "0.5.1"
+backtrace = "0.3"

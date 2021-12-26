@@ -1,9 +1,7 @@
-use std::borrow::Cow;
 use std::io::Write;
 use std::mem::ManuallyDrop;
 use std::time::Instant;
-use libc::{c_void, size_t};
-use libunwind_sys::unw_set_caching_policy;
+use libc::{backtrace, c_void};
 
 use crate::trace::{Trace, TraceTree};
 
@@ -28,7 +26,6 @@ impl<W: Write> HeaptrackWriter<W> {
     }
 
     pub fn init(&mut self) {
-        unsafe { unw_set_caching_policy(libunwind_sys::_Ux86_64_local_addr_space, libunwind_sys::unw_caching_policy_t_UNW_CACHE_PER_THREAD); }
         self.write_version();
         self.write_exe();
         self.write_command_line();
@@ -91,8 +88,8 @@ impl<W: Write> HeaptrackWriter<W> {
             self.module_cache_dirty = false;
             self.inner.writer.write_all(b"m 1 -\n").expect("write_all failed");
 
-            unsafe extern "C" fn dl_iterate_phdr_callback(info: *mut libc::dl_phdr_info, size: libc::size_t, data: *mut c_void) -> libc::c_int {
-                let mut writer: Box<Box<&mut dyn Write>> = Box::from_raw(data as _);
+            unsafe extern "C" fn dl_iterate_phdr_callback(info: *mut libc::dl_phdr_info, _size: libc::size_t, data: *mut c_void) -> libc::c_int {
+                let writer: Box<Box<&mut dyn Write>> = Box::from_raw(data as _);
                 let mut writer = ManuallyDrop::new(writer);
 
                 let filename = if (*info).dlpi_name.is_null() {
@@ -119,7 +116,7 @@ impl<W: Write> HeaptrackWriter<W> {
                 0
             }
 
-            let mut writer = Box::new(Box::new(&mut self.inner.writer as &mut dyn Write));
+            let writer = Box::new(Box::new(&mut self.inner.writer as &mut dyn Write));
             let data = Box::into_raw(writer);
             unsafe {
                 libc::dl_iterate_phdr(Some(dl_iterate_phdr_callback), data as _);

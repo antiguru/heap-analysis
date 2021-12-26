@@ -68,7 +68,6 @@ const TRACE_MAX_SIZE: usize = 64;
 
 pub struct Trace {
     size: usize,
-    skip: usize,
     data: [*mut c_void; TRACE_MAX_SIZE],
 }
 
@@ -81,28 +80,36 @@ impl std::ops::Deref for Trace {
 }
 
 impl Trace {
-    pub fn new() -> Self {
+    #[inline(never)]
+    pub fn new(stop: *mut c_void) -> Self {
         let mut trace = Self {
             size: 0,
-            skip: 0,
             data: [0 as *mut c_void; TRACE_MAX_SIZE],
         };
-        trace.fill(2);
+        trace.fill(stop);
         trace
     }
 
-    pub fn fill(&mut self, skip: usize) {
-        let mut size = unsafe { libunwind_sys::unw_backtrace(self.data.as_mut_ptr(), TRACE_MAX_SIZE as _) };
-        if size < 0 {
-            self.size = 0;
-            self.skip = 0;
-        } else {
-            let mut size = size as usize;
-            while size > 0 && self.data[size - 1] == 0 as *mut c_void {
-                size -= 1;
+    pub fn fill(&mut self, stop: *mut c_void) {
+        let mut index = 0;
+        let data = &mut self.data;
+        data.fill(0 as _);
+
+        let mut record = false;
+        backtrace::trace(|frame| {
+            if !record {
+                let symbol = frame.symbol_address();
+                record = symbol == stop;
+            } else {
+                data[index] = frame.ip();
+                index += 1;
             }
-            self.size = size.saturating_sub(skip);
-            self.skip = skip;
+            index < data.len()
+        });
+        let mut size = index;
+        while size > 0 && self.data[size - 1] == 0 as *mut c_void {
+            size -= 1;
         }
+        self.size = size;
     }
 }
