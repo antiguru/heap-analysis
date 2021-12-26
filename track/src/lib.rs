@@ -6,8 +6,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use lazy_static::lazy_static;
+use track_types::TraceInstruction;
 
-use crate::heaptrack::{HeaptrackWriter, TraceInstruction};
+use crate::heaptrack::HeaptrackWriter;
 use crate::trace::Trace;
 
 pub mod heaptrack;

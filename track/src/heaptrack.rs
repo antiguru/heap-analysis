@@ -1,40 +1,9 @@
 use std::sync::{Arc, Mutex};
 
-use serde::{Deserialize, Serialize};
+use track_types::{InstrAllocate, InstrFree, InstrStack, TraceInstruction};
 
 use crate::trace::{Trace, TraceTree};
 use crate::HeaptrackGatherHandle;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum TraceInstruction {
-    Init(TraceInstructionInit),
-    Stack(TraceInstructionStack),
-    Allocate(TraceInstructionAllocate),
-    Free(TraceInstructionFree),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TraceInstructionInit {
-    pub thread_name: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TraceInstructionStack {
-    pub name: String,
-    pub parent: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TraceInstructionAllocate {
-    pub size: usize,
-    pub ptr: u64,
-    pub trace_index: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TraceInstructionFree {
-    pub ptr: u64,
-}
 
 pub struct HeaptrackWriter {
     trace_tree: TraceTree,
@@ -104,14 +73,14 @@ impl HeaptrackWriter {
                 });
             }
             let symbol = symbol.unwrap_or_else(|| "<unresolved>".to_owned());
-            trace_buffer.trace(TraceInstruction::Stack(TraceInstructionStack {
+            trace_buffer.trace(TraceInstruction::Stack(InstrStack {
                 name: symbol,
                 parent: index as _,
             }));
             true
         });
         self.trace_buffer
-            .trace(TraceInstruction::Allocate(TraceInstructionAllocate {
+            .trace(TraceInstruction::Allocate(InstrAllocate {
                 trace_index: index as _,
                 ptr: ptr as _,
                 size,
@@ -120,8 +89,6 @@ impl HeaptrackWriter {
 
     pub fn handle_free(&mut self, ptr: *mut u8) {
         self.trace_buffer
-            .trace(TraceInstruction::Free(TraceInstructionFree {
-                ptr: ptr as _,
-            }))
+            .trace(TraceInstruction::Free(InstrFree { ptr: ptr as _ }))
     }
 }

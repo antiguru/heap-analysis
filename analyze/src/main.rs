@@ -1,11 +1,13 @@
-use crossbeam_channel::TryRecvError;
 use std::net::TcpListener;
 use std::time::{Duration, Instant};
+
+use crossbeam_channel::TryRecvError;
+
 use timely::dataflow::operators::generic::source;
 use timely::dataflow::operators::Inspect;
 use timely::scheduling::Scheduler;
 
-use heaptrack_rust_track::heaptrack::TraceInstruction;
+use track_types::TraceInstruction;
 
 fn main() {
     timely::execute_from_args(std::env::args(), |worker| {
