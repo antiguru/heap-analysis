@@ -90,6 +90,16 @@ impl<W: Write> HeaptrackWriter<W> {
             inner
                 .write_hex_line('t', &[ip as usize - 1, index as _])
                 .expect("write failed");
+            let mut symbol = None;
+            {
+                let symbol = &mut symbol;
+                backtrace::resolve(ip as _, |sym| {
+                    *symbol = sym.name().map(|name| format!("{:#}", name));
+                });
+            }
+            if let Some(symbol) = symbol {
+                write!(inner.writer, "# {}\n", symbol);
+            }
             true
         });
         self.inner
