@@ -1,11 +1,12 @@
-use heaptrack_rust_track::HeaptrackAllocator;
+use heaptrack_rust_track::TrackingAllocator;
 use timely::dataflow::operators::flow_controlled::{iterator_source, IteratorSourceInput};
 use timely::dataflow::operators::{probe, Inspect, Probe};
 
 #[global_allocator]
-static ALLOC: heaptrack_rust_track::HeaptrackAllocator = HeaptrackAllocator;
+static ALLOC: heaptrack_rust_track::TrackingAllocator = TrackingAllocator;
 
 fn main() {
+    TrackingAllocator::start();
     timely::execute_from_args(std::env::args(), |worker| {
         let mut input = (0u64..100000).peekable();
         worker.dataflow(|scope| {

@@ -1,84 +1,104 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::RefCell;
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use lazy_static::lazy_static;
-use track_types::TraceInstruction;
+use track_types::{InstrAllocate, InstrFree, InstrStack};
+use track_types::{InstrInit, TraceInstruction};
 
-use crate::heaptrack::HeaptrackWriter;
-use crate::trace::Trace;
+use crate::stacktrace::Trace;
+use crate::stacktrace::TraceTree;
 
-pub mod heaptrack;
-mod trace;
+mod stacktrace;
 
-pub struct HeaptrackAllocator;
+pub struct TrackingAllocator;
 
-struct HeaptrackInner {
-    writer: HeaptrackWriter,
+impl TrackingAllocator {
+    pub fn start() {
+        START_TRACKING.store(true, Ordering::SeqCst);
+    }
 }
 
-enum HeaptrackState {
+unsafe impl GlobalAlloc for TrackingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = System.alloc(layout);
+        let trace = Trace::new(Self::alloc as _);
+        AllocatorInner::writer(|writer| writer.handle_malloc(ptr, layout.size(), &trace));
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        AllocatorInner::writer(|writer| writer.handle_free(ptr));
+        System.dealloc(ptr, layout)
+    }
+}
+
+pub(crate) struct AllocatorInner {
+    writer: AllocationWriter,
+}
+
+enum TrackingState {
     /// Not initialized
     None,
     /// Ready to track allocations
-    Ready(HeaptrackInner),
+    Ready(AllocatorInner),
     /// Tracking permanently disabled
     Disabled,
 }
 
 #[derive(Debug)]
-enum HeaptrackGathererProtocol {
-    Flush(Vec<TraceInstruction>),
-    Register(Arc<Mutex<Vec<TraceInstruction>>>),
+enum GathererProtocol {
+    Flush(usize, Vec<TraceInstruction>),
+    Register(Arc<Mutex<ThreadState>>),
 }
 
 #[derive(Clone, Debug)]
-pub struct HeaptrackGatherHandle {
-    sender: Option<crossbeam_channel::Sender<HeaptrackGathererProtocol>>,
+pub struct GatherHandle {
+    sender: Option<crossbeam_channel::Sender<GathererProtocol>>,
     handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
-impl Default for HeaptrackGatherHandle {
+impl Default for GatherHandle {
     fn default() -> Self {
         let (sender, receiver) = crossbeam_channel::unbounded();
 
         let handle = std::thread::spawn(|| {
             // Disable tracking for this thread
-            HeaptrackInner::WRITER.with(|x| *x.borrow_mut() = HeaptrackState::Disabled);
-            let mut gatherer = HeaptrackGatherer::new(receiver);
+            AllocatorInner::WRITER.with(|x| *x.borrow_mut() = TrackingState::Disabled);
+            let mut gatherer = Gatherer::new(receiver);
             gatherer.run();
         });
-        let handle = Some(handle);
 
         Self {
             sender: Some(sender),
-            handle: Arc::new(Mutex::new(handle)),
+            handle: Arc::new(Mutex::new(Some(handle))),
         }
     }
 }
 
-impl HeaptrackGatherHandle {
-    pub fn register(&self, buffer: Arc<Mutex<Vec<TraceInstruction>>>) {
+impl GatherHandle {
+    fn register(&self, buffer: Arc<Mutex<ThreadState>>) {
         self.sender
             .as_ref()
             .expect("Sender exists until drop")
-            .send(HeaptrackGathererProtocol::Register(buffer))
+            .send(GathererProtocol::Register(buffer))
             .unwrap();
     }
 
-    pub fn flush(&self, buffer: Vec<TraceInstruction>) {
+    fn flush(&self, thread_id: usize, buffer: Vec<TraceInstruction>) {
         self.sender
             .as_ref()
             .expect("Sender exists until drop")
-            .send(HeaptrackGathererProtocol::Flush(buffer))
+            .send(GathererProtocol::Flush(thread_id, buffer))
             .unwrap();
     }
 }
 
-impl Drop for HeaptrackGatherHandle {
+impl Drop for GatherHandle {
     fn drop(&mut self) {
         self.sender.take();
         // strong count == 2 -> static reference + main thread, so we're the last thread to exit
@@ -86,23 +106,25 @@ impl Drop for HeaptrackGatherHandle {
             // Take ownership of the join handle
             let handle = std::mem::take(&mut self.handle);
             // try lock to avoid recusive locks on `GATHER`
-            let _ = GATHER.try_lock().map(|mut guard| guard.take());
+            std::mem::drop(GATHER.try_lock().map(|mut guard| guard.take()));
             // Now, the gatherer thread can exit, and we wait for it
-            let _ = handle
-                .lock()
-                .map(|mut handle| handle.take().map(|handle| handle.join()));
+            std::mem::drop(
+                handle
+                    .lock()
+                    .map(|mut handle| handle.take().map(|handle| handle.join())),
+            );
         }
     }
 }
 
-struct HeaptrackGatherer {
-    buffers: Vec<Arc<Mutex<Vec<TraceInstruction>>>>,
-    receiver: crossbeam_channel::Receiver<HeaptrackGathererProtocol>,
+struct Gatherer {
+    buffers: Vec<Arc<Mutex<ThreadState>>>,
+    receiver: crossbeam_channel::Receiver<GathererProtocol>,
     connection: TcpStream,
 }
 
-impl HeaptrackGatherer {
-    fn new(receiver: crossbeam_channel::Receiver<HeaptrackGathererProtocol>) -> Self {
+impl Gatherer {
+    fn new(receiver: crossbeam_channel::Receiver<GathererProtocol>) -> Self {
         let connection = TcpStream::connect("127.0.0.1:64123").unwrap();
         Self {
             buffers: Default::default(),
@@ -119,11 +141,11 @@ impl HeaptrackGatherer {
                     match msg {
                        Ok(protocol) => {
                             match protocol {
-                                HeaptrackGathererProtocol::Register(shared_buffer) => {
+                                GathererProtocol::Register(shared_buffer) => {
                                     self.buffers.push(shared_buffer);
                                 },
-                                HeaptrackGathererProtocol::Flush(buffer) => {
-                                    self.handle_buffer(&buffer);
+                                GathererProtocol::Flush(thread_id, buffer) => {
+                                    self.handle_buffer(thread_id, &buffer);
                                 },
                             }
                         }
@@ -139,47 +161,51 @@ impl HeaptrackGatherer {
 
     fn handle_buffers(&mut self) {
         for index in 0..self.buffers.len() {
-            self.handle_buffer(&std::mem::take(&mut *self.buffers[index].lock().unwrap()));
+            let mut guard = self.buffers[index].lock().unwrap();
+            self.handle_buffer(guard.thread_id, &std::mem::take(&mut guard.buffer));
         }
     }
 
-    fn handle_buffer(&self, buffer: &Vec<TraceInstruction>) {
+    fn handle_buffer(&self, thread_id: usize, buffer: &[TraceInstruction]) {
         if buffer.is_empty() {
             return;
         }
-        bincode::serialize_into(&self.connection, buffer).unwrap();
+        bincode::serialize_into(&self.connection, &(thread_id, buffer)).unwrap();
     }
 }
 
-impl Drop for HeaptrackGatherer {
+impl Drop for Gatherer {
     fn drop(&mut self) {
-        for shared_buffer in &self.buffers {
-            self.handle_buffer(&std::mem::take(&mut *shared_buffer.lock().unwrap()));
-        }
+        self.handle_buffers();
     }
 }
 
 lazy_static! {
-    static ref GATHER: Mutex<Option<HeaptrackGatherHandle>> = Mutex::new(Some(Default::default()));
+    static ref GATHER: Mutex<Option<GatherHandle>> = Mutex::new(Some(Default::default()));
 }
 
-impl HeaptrackInner {
+static START_TRACKING: AtomicBool = AtomicBool::new(false);
+
+impl AllocatorInner {
     thread_local! {
-        static WRITER: RefCell<HeaptrackState> = RefCell::new(HeaptrackState::None)
+        static WRITER: RefCell<TrackingState> = RefCell::new(TrackingState::None)
     }
 
-    fn writer<F: FnOnce(&mut HeaptrackWriter)>(f: F) {
-        let _ = HeaptrackInner::WRITER.try_with(|x| {
+    fn writer<F: FnOnce(&mut AllocationWriter)>(f: F) {
+        let _ = AllocatorInner::WRITER.try_with(|x| {
+            if !START_TRACKING.load(Ordering::SeqCst) {
+                return;
+            }
             // Try to borrow. Prevents re-entrant allocations and allocations after dropping
             if let Ok(mut borrow) = x.try_borrow_mut() {
-                if matches!(*borrow, HeaptrackState::None) {
-                    let mut inner = HeaptrackInner {
-                        writer: HeaptrackWriter::new(GATHER.lock().unwrap().clone().unwrap()),
+                if matches!(*borrow, TrackingState::None) {
+                    let mut inner = AllocatorInner {
+                        writer: AllocationWriter::new(GATHER.lock().unwrap().clone().unwrap()),
                     };
                     inner.writer.init();
-                    *borrow = HeaptrackState::Ready(inner);
+                    *borrow = TrackingState::Ready(inner);
                 }
-                if let HeaptrackState::Ready(inner) = &mut *borrow {
+                if let TrackingState::Ready(inner) = &mut *borrow {
                     f(&mut inner.writer);
                 }
             }
@@ -187,16 +213,105 @@ impl HeaptrackInner {
     }
 }
 
-unsafe impl GlobalAlloc for HeaptrackAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = System.alloc(layout);
-        let trace = Trace::new(Self::alloc as _);
-        HeaptrackInner::writer(|writer| writer.handle_malloc(ptr, layout.size(), &trace));
-        ptr
+pub struct AllocationWriter {
+    trace_tree: TraceTree,
+    trace_buffer: TraceBuffer,
+}
+
+#[derive(Debug)]
+struct ThreadState {
+    buffer: Vec<TraceInstruction>,
+    thread_id: usize,
+}
+
+impl Default for ThreadState {
+    fn default() -> Self {
+        Self {
+            buffer: Default::default(),
+            thread_id: thread_id::get(),
+        }
+    }
+}
+
+struct TraceBuffer {
+    handle: GatherHandle,
+    buffer: Arc<Mutex<ThreadState>>,
+}
+
+impl TraceBuffer {
+    fn new(handle: GatherHandle) -> Self {
+        Self {
+            handle,
+            buffer: Default::default(),
+        }
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        HeaptrackInner::writer(|writer| writer.handle_free(ptr));
-        System.dealloc(ptr, layout)
+    fn init(&mut self) {
+        self.handle.register(self.buffer.clone());
+        self.trace(TraceInstruction::Init(InstrInit {
+            thread_name: format!("{:?}", std::thread::current().id().to_owned()),
+            thread_id: thread_id::get(),
+        }))
+    }
+
+    fn trace(&mut self, instruction: TraceInstruction) {
+        let mut guard = self.buffer.lock().unwrap();
+        let buffer = &mut guard.buffer;
+        if buffer.capacity() < 1024 {
+            let to_reserve = 1024 - buffer.capacity();
+            buffer.reserve(to_reserve);
+        }
+        buffer.push(instruction);
+        if buffer.len() == buffer.capacity() {
+            let buffer = std::mem::take(&mut *buffer);
+            self.handle.flush(guard.thread_id, buffer);
+        }
+    }
+}
+
+impl AllocationWriter {
+    pub fn new(handle: GatherHandle) -> Self {
+        Self {
+            trace_tree: Default::default(),
+            trace_buffer: TraceBuffer::new(handle),
+        }
+    }
+
+    pub fn init(&mut self) {
+        self.trace_buffer.init();
+    }
+
+    fn _write_timestamp(&mut self) {
+        // TODO
+    }
+
+    pub fn handle_malloc(&mut self, ptr: *mut u8, size: usize, trace: &Trace) {
+        let trace_buffer = &mut self.trace_buffer;
+        let index = self.trace_tree.index(trace, |ip, index| {
+            let mut symbol = None;
+            {
+                let symbol = &mut symbol;
+                backtrace::resolve(ip as _, |sym| {
+                    *symbol = sym.name().map(|name| format!("{:#}", name));
+                });
+            }
+            let symbol = symbol.unwrap_or_else(|| "<unresolved>".to_owned());
+            trace_buffer.trace(TraceInstruction::Stack(InstrStack {
+                name: symbol,
+                parent: index as _,
+            }));
+            true
+        });
+        self.trace_buffer
+            .trace(TraceInstruction::Allocate(InstrAllocate {
+                trace_index: index as _,
+                ptr: ptr as _,
+                size,
+            }))
+    }
+
+    pub fn handle_free(&mut self, ptr: *mut u8) {
+        self.trace_buffer
+            .trace(TraceInstruction::Free(InstrFree { ptr: ptr as _ }))
     }
 }

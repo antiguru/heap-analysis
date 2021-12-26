@@ -18,7 +18,7 @@ fn main() {
                 let listener = TcpListener::bind(format!("127.0.0.1:{}", 64123)).unwrap();
                 let stream = listener.incoming().next().unwrap().unwrap();
                 loop {
-                    match bincode::deserialize_from::<_, Vec<TraceInstruction>>(&stream) {
+                    match bincode::deserialize_from::<_, (usize, Vec<TraceInstruction>)>(&stream) {
                         Ok(data) => sender.send(data).unwrap(),
                         Err(err) => {
                             eprintln!("Exiting reader thread: {:?}", err);
@@ -43,7 +43,8 @@ fn main() {
                         cap.downgrade(&(time.elapsed().as_nanos() as u64));
                         if let Some(conn) = &conn {
                             match conn.try_recv() {
-                                Ok(mut data) => {
+                                Ok((thread_id, mut data)) => {
+                                    let mut data = data.drain(..).map(|d| (thread_id, d)).collect();
                                     output.session(&cap).give_vec(&mut data);
                                     (false, true)
                                 }

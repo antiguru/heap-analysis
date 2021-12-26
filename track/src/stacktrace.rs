@@ -1,26 +1,35 @@
+//! This module is loosely based on what Heaptrack uses to observe memory allocations
+
 use std::ffi::c_void;
 use std::ops::Deref;
 
+/// A representative for an instruction pointer in the back trace.
 #[derive(Debug)]
 struct TraceEdge {
+    /// The instruction pointer, pointing to the current instruction
     instruction_pointer: *mut c_void,
-    index: u32,
+    /// Tree-relative index of this edge
+    index: usize,
+    /// Sorted list of children
     children: Vec<TraceEdge>,
 }
 
 impl Default for TraceEdge {
     fn default() -> Self {
         Self {
-            instruction_pointer: 0 as *mut c_void,
+            instruction_pointer: std::ptr::null_mut(),
             index: 0,
             children: Default::default(),
         }
     }
 }
 
+/// A tree of trace edges
 pub struct TraceTree {
+    /// The root of the tree
     root: TraceEdge,
-    index: u32,
+    /// Next index to assign.
+    index: usize,
 }
 
 impl Default for TraceTree {
@@ -33,11 +42,14 @@ impl Default for TraceTree {
 }
 
 impl TraceTree {
-    pub fn index<C: FnMut(*const c_void, u32) -> bool>(
+    /// Obtain the index for the current instruction outside of the tracing logic
+    ///
+    /// Calls the callback for any newly encountered instruction pointer, or a new path.
+    pub fn index<C: FnMut(*const c_void, usize) -> bool>(
         &mut self,
         trace: &Trace,
         mut callback: C,
-    ) -> u32 {
+    ) -> usize {
         let mut index = 0;
         let mut parent = &mut self.root;
         for ip in trace.deref().iter().rev() {
@@ -73,6 +85,7 @@ impl TraceTree {
 
 const TRACE_MAX_SIZE: usize = 64;
 
+/// A size-limited stack trace composed of instruction pointers
 pub struct Trace {
     size: usize,
     data: [*mut c_void; TRACE_MAX_SIZE],
@@ -87,16 +100,18 @@ impl std::ops::Deref for Trace {
 }
 
 impl Trace {
+    /// Construct and fill a new trace, stopping at `stop`.
     #[inline(never)]
     pub fn new(stop: *mut c_void) -> Self {
         let mut trace = Self {
             size: 0,
-            data: [0 as *mut c_void; TRACE_MAX_SIZE],
+            data: [std::ptr::null_mut(); TRACE_MAX_SIZE],
         };
         trace.fill(stop);
         trace
     }
 
+    /// Fill a trace from the current call stack.
     pub fn fill(&mut self, stop: *mut c_void) {
         let mut index = 0;
         let data = &mut self.data;
@@ -116,7 +131,7 @@ impl Trace {
             });
         }
         let mut size = index;
-        while size > 0 && self.data[size - 1] == 0 as *mut c_void {
+        while size > 0 && self.data[size - 1].is_null() {
             size -= 1;
         }
         self.size = size;

@@ -11,6 +11,7 @@ pub enum TraceInstruction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstrInit {
     pub thread_name: String,
+    pub thread_id: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
