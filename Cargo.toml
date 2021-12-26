@@ -1,2 +1,2 @@
 [workspace]
-members = ["example", "track"]
+members = ["analyze", "example", "track"]

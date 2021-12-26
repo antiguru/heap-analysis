@@ -1,5 +1,6 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::RefCell;
+use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -9,7 +10,7 @@ use lazy_static::lazy_static;
 use crate::heaptrack::{HeaptrackWriter, TraceInstruction};
 use crate::trace::Trace;
 
-mod heaptrack;
+pub mod heaptrack;
 mod trace;
 
 pub struct HeaptrackAllocator;
@@ -96,13 +97,16 @@ impl Drop for HeaptrackGatherHandle {
 struct HeaptrackGatherer {
     buffers: Vec<Arc<Mutex<Vec<TraceInstruction>>>>,
     receiver: crossbeam_channel::Receiver<HeaptrackGathererProtocol>,
+    connection: TcpStream,
 }
 
 impl HeaptrackGatherer {
     fn new(receiver: crossbeam_channel::Receiver<HeaptrackGathererProtocol>) -> Self {
+        let connection = TcpStream::connect("127.0.0.1:64123").unwrap();
         Self {
             buffers: Default::default(),
             receiver,
+            connection,
         }
     }
 
@@ -118,7 +122,7 @@ impl HeaptrackGatherer {
                                     self.buffers.push(shared_buffer);
                                 },
                                 HeaptrackGathererProtocol::Flush(buffer) => {
-                                    self.handle_buffer(buffer);
+                                    self.handle_buffer(&buffer);
                                 },
                             }
                         }
@@ -134,21 +138,22 @@ impl HeaptrackGatherer {
 
     fn handle_buffers(&mut self) {
         for index in 0..self.buffers.len() {
-            self.handle_buffer(std::mem::take(&mut *self.buffers[index].lock().unwrap()));
+            self.handle_buffer(&std::mem::take(&mut *self.buffers[index].lock().unwrap()));
         }
     }
 
-    fn handle_buffer(&self, buffer: Vec<TraceInstruction>) {
-        for instruction in &buffer {
-            println!("instruction: {:?}", instruction);
+    fn handle_buffer(&self, buffer: &Vec<TraceInstruction>) {
+        if buffer.is_empty() {
+            return;
         }
+        bincode::serialize_into(&self.connection, buffer).unwrap();
     }
 }
 
 impl Drop for HeaptrackGatherer {
     fn drop(&mut self) {
         for shared_buffer in &self.buffers {
-            self.handle_buffer(std::mem::take(&mut *shared_buffer.lock().unwrap()));
+            self.handle_buffer(&std::mem::take(&mut *shared_buffer.lock().unwrap()));
         }
     }
 }

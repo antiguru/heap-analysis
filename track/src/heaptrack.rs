@@ -1,9 +1,11 @@
-use crate::HeaptrackGatherHandle;
 use std::sync::{Arc, Mutex};
 
-use crate::trace::{Trace, TraceTree};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug)]
+use crate::trace::{Trace, TraceTree};
+use crate::HeaptrackGatherHandle;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TraceInstruction {
     Init(TraceInstructionInit),
     Stack(TraceInstructionStack),
@@ -11,25 +13,25 @@ pub enum TraceInstruction {
     Free(TraceInstructionFree),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceInstructionInit {
     pub thread_name: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceInstructionStack {
     pub name: String,
     pub parent: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceInstructionAllocate {
     pub size: usize,
     pub ptr: u64,
     pub trace_index: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceInstructionFree {
     pub ptr: u64,
 }
