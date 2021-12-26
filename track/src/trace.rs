@@ -33,14 +33,21 @@ impl Default for TraceTree {
 }
 
 impl TraceTree {
-    pub fn index<C: FnMut(*const c_void, u32) -> bool>(&mut self, trace: &Trace, mut callback: C) -> u32 {
+    pub fn index<C: FnMut(*const c_void, u32) -> bool>(
+        &mut self,
+        trace: &Trace,
+        mut callback: C,
+    ) -> u32 {
         let mut index = 0;
         let mut parent = &mut self.root;
         for ip in trace.deref().iter().rev() {
             if ip.is_null() {
                 continue;
             }
-            let position = match parent.children.binary_search_by(|edge| edge.instruction_pointer.cmp(ip)) {
+            let position = match parent
+                .children
+                .binary_search_by(|edge| edge.instruction_pointer.cmp(ip))
+            {
                 Ok(position) => position,
                 Err(position) => {
                     index = self.index;

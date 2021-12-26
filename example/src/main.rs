@@ -6,8 +6,8 @@ static ALLOC: heaptrack_rust_track::HeaptrackAllocator = HeaptrackAllocator;
 fn test() -> String {
     let mut s = " ".to_owned();
     for _ in 0..22 {
-       s = format!("{}{}", s, s);
-    };
+        s = format!("{}{}", s, s);
+    }
     s
 }
 

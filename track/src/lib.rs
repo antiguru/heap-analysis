@@ -31,7 +31,10 @@ impl HeaptrackInner {
             if let Ok(mut borrow) = x.try_borrow_mut() {
                 if matches!(*borrow, HeaptrackState::None) {
                     let mut inner = HeaptrackInner {
-                        writer: HeaptrackWriter::new(std::fs::File::create(Path::new("heaptrack.XX")).unwrap(), Instant::now()),
+                        writer: HeaptrackWriter::new(
+                            std::fs::File::create(Path::new("heaptrack.XX")).unwrap(),
+                            Instant::now(),
+                        ),
                         in_alloc: false,
                     };
                     inner.writer.init();
@@ -61,9 +64,7 @@ unsafe impl GlobalAlloc for HeaptrackAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        HeaptrackInner::writer(|writer| {
-            writer.handle_free(ptr)
-        });
+        HeaptrackInner::writer(|writer| writer.handle_free(ptr));
         System.dealloc(ptr, layout)
     }
 }
