@@ -1,4 +1,4 @@
-# Heap analysis tool for Rust
+# Heap analysis tool for Rust #
 
 Heap analysis is a pure-Rust implementation to track memory allocations on the heap.
 
@@ -8,7 +8,7 @@ _Heap analysis_ provides a custom allocator that wraps the application's own all
 this crate and declare it as the global allocator like this:
 
 ```rust
-/// 
+/// Global allocator wrapping other allocator.
 #[global_allocator]
 static ALLOC: heaptrack_rust_track::TrackingAllocator<std::alloc::System> = TrackingAllocator(std::alloc::System);
 
@@ -32,3 +32,10 @@ symbol `HEAP_ANALYSIS_ADDR`.
    cargo run --example flow_controlled --release -- -w 8
    ```
 3. Observe the output of the `analyze` program.
+
+## Limitations
+
+* No detection for stopped threads. The current `thread_id` can be recycled. It is only unique amongst other concurrent
+  threads.
+* All serialization is performed by a single thread. This thread can bottleneck the outgoing data.
+* Obtaining the backtrace is slow. It gets slightly faster once all symbols have been resolved.

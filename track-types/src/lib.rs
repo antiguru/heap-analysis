@@ -5,9 +5,10 @@
 use serde::{Deserialize, Serialize};
 
 /// Environment symbol for the heap analysis address.
-pub static ENV_HEAP_ANALYSIS_ADDR: &str = "HEAP_ANALSIS_ADDR";
+pub static ENV_HEAP_ANALYSIS_ADDR: &str = "HEAP_ANALYSIS_ADDR";
 
-/// Timestamp type, roughly nanoseconds since start of tracking.
+/// Nanosecond timestamp type, not relative to a specific moment in time. Can only be used to
+/// compare to each other.
 pub type Timestamp = u64;
 
 /// A timestamped trace instruction.
@@ -55,10 +56,25 @@ pub struct InstrInit {
 /// the n-th chronological frame on the same thread.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstrStack {
-    /// Resolved symbol
-    pub name: String,
+    /// Resolved symbol, heap-allocated to reduce the size of [TraceInstruction]
+    pub details: Box<InstrStackDetails>,
     /// Number of the parent stack frame
     pub parent: usize,
+}
+
+/// Symbol details
+///
+/// The availability of some data depends on debug information, especially filename/lineno/colno.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct InstrStackDetails {
+    /// Name of the symbol.
+    pub name: Option<String>,
+    /// Filename.
+    pub filename: Option<std::path::PathBuf>,
+    /// Line of the instruction.
+    pub lineno: Option<u32>,
+    /// Column of the instruction.
+    pub colno: Option<u32>,
 }
 
 /// Announce a memory allocation
@@ -77,4 +93,6 @@ pub struct InstrAllocate {
 pub struct InstrFree {
     /// Pointer
     pub ptr: u64,
+    /// Stack frame
+    pub trace_index: usize,
 }

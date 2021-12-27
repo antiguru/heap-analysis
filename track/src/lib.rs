@@ -6,17 +6,18 @@ use std::alloc::{GlobalAlloc, Layout};
 use std::cell::RefCell;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crossbeam_channel::{select, tick, unbounded, Receiver, Sender};
 
 use lazy_static::lazy_static;
+use libc::c_void;
 
 use track_types::{
-    InstrAllocate, InstrFree, InstrInit, InstrStack, TimestampedTraceInstruction, TraceInstruction,
-    TraceProtocol, ENV_HEAP_ANALYSIS_ADDR,
+    InstrAllocate, InstrFree, InstrInit, InstrStack, InstrStackDetails,
+    TimestampedTraceInstruction, TraceInstruction, TraceProtocol, ENV_HEAP_ANALYSIS_ADDR,
 };
 
 use crate::stacktrace::Trace;
@@ -47,13 +48,14 @@ static START_TRACKING: AtomicBool = AtomicBool::new(false);
 unsafe impl<A: GlobalAlloc> GlobalAlloc for TrackingAllocator<A> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = self.0.alloc(layout);
-        let trace = Trace::new(Self::alloc as _);
-        AllocationWriter::writer(|writer| writer.handle_malloc(ptr, layout.size(), &trace));
+        AllocationWriter::writer(|writer| {
+            writer.handle_malloc(ptr as _, layout.size(), Self::alloc as _)
+        });
         ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        AllocationWriter::writer(|writer| writer.handle_free(ptr));
+        AllocationWriter::writer(|writer| writer.handle_free(ptr as _, Self::dealloc as _));
         self.0.dealloc(ptr, layout)
     }
 }
@@ -73,7 +75,7 @@ enum GathererProtocol {
     /// Flush a complete trace buffer
     Flush(usize, Vec<TimestampedTraceInstruction>),
     /// Register a shared handle to this thread's state
-    Register(Arc<Mutex<ThreadState>>),
+    Register(Arc<Mutex<ThreadState>>, Arc<(Mutex<bool>, Condvar)>),
 }
 
 /// Handle to the gatherer thread
@@ -108,11 +110,22 @@ impl Default for GatherHandle {
 impl GatherHandle {
     /// Register a thread state with the gatherer
     fn register(&self, thread_state: Arc<Mutex<ThreadState>>) {
+        let condvar = Arc::new((Mutex::new(false), Condvar::new()));
         self.sender
             .as_ref()
             .expect("Sender exists until drop")
-            .send(GathererProtocol::Register(thread_state))
+            .send(GathererProtocol::Register(
+                thread_state,
+                Arc::clone(&condvar),
+            ))
             .unwrap();
+
+        // Wait for the gather thread to accept our registration, only then we're allowed to allocate memory
+        let (lock, signal) = &*condvar;
+        let mut started = lock.lock().unwrap();
+        while !*started {
+            started = signal.wait(started).unwrap();
+        }
     }
 
     /// Send a complete buffer to the gatherer
@@ -169,15 +182,19 @@ impl Gatherer {
 
     /// Handle data from worker threads. Returns once all work threads disappear.
     fn run(&mut self) {
-        let tick = tick(Duration::from_millis(100));
+        let tick = tick(Duration::from_millis(1000));
         loop {
             select! {
                 recv(self.receiver) -> msg => {
                     match msg {
                        Ok(protocol) => {
                             match protocol {
-                                GathererProtocol::Register(shared_buffer) => {
+                                GathererProtocol::Register(shared_buffer, condvar) => {
                                     self.buffers.push(shared_buffer);
+                                    let (lock, signal) = &*condvar;
+                                    let mut started = lock.lock().unwrap();
+                                    *started = true;
+                                    signal.notify_one();
                                 },
                                 GathererProtocol::Flush(thread_id, mut buffer) => {
                                     self.send_buffer(thread_id, &mut buffer);
@@ -197,20 +214,23 @@ impl Gatherer {
     /// Forcibly flush buffers from worker threads
     fn handle_buffers(&mut self) {
         let time = START_TIME.elapsed().as_nanos() as u64;
-        let mut buffer = Vec::with_capacity(1024);
+        let mut buffer = Vec::with_capacity(TraceBuffer::capacity());
         for index in 0..self.buffers.len() {
             // Limit scope of lock to not include sending data over the network
             let thread_id = {
                 let mut guard = self.buffers[index].lock().unwrap();
-                let position = match guard.buffer.binary_search_by(|x| x.1.cmp(&time)) {
-                    Ok(position) => position + 1,
-                    Err(position) => position,
-                };
+                // Determine all data recorded before `time`
+                let position = guard.buffer.partition_point(|x| x.1 < time);
                 buffer.extend(guard.buffer.drain(..position));
                 guard.thread_id
             };
             self.send_buffer(thread_id, &mut buffer);
         }
+        bincode::serialize_into::<_, TraceProtocol>(
+            &self.connection,
+            &TraceProtocol::Timestamp(time),
+        )
+        .unwrap();
     }
 
     /// Send a buffer.
@@ -250,11 +270,12 @@ impl AllocationWriter {
     ///
     /// The function `f` will only be called if tracking is enabled. Also, this method ignores
     /// reentrant calls.
+    #[inline(always)]
     fn writer<F: FnOnce(&mut AllocationWriter)>(f: F) {
+        if !START_TRACKING.load(Ordering::SeqCst) {
+            return;
+        }
         let _ = AllocationWriter::WRITER.try_with(|x| {
-            if !START_TRACKING.load(Ordering::SeqCst) {
-                return;
-            }
             // Try to borrow. Prevents re-entrant allocations and allocations after dropping
             if let Ok(mut borrow) = x.try_borrow_mut() {
                 if matches!(*borrow, TrackingState::None) {
@@ -282,36 +303,38 @@ impl AllocationWriter {
 
     fn alloc_index(&mut self, trace: &Trace) -> usize {
         let trace_buffer = &mut self.trace_buffer;
-        self.trace_tree.index(trace, |ip, index| {
-            let mut symbol = None;
+        self.trace_tree.index(trace, |ip, parent| {
+            let mut details = InstrStackDetails::default();
             {
-                let symbol = &mut symbol;
                 backtrace::resolve(ip as _, |sym| {
-                    *symbol = sym.name().map(|name| format!("{:#}", name));
+                    details.name = sym.name().map(|name| format!("{:#}", name));
+                    details.filename = sym.filename().map(Into::into);
+                    details.lineno = sym.lineno();
+                    details.colno = sym.colno();
                 });
             }
-            let symbol = symbol.unwrap_or_else(|| "<unresolved>".to_owned());
-            trace_buffer.push(TraceInstruction::Stack(InstrStack {
-                name: symbol,
-                parent: index as _,
-            }));
+            let details = Box::new(details);
+            trace_buffer.push(TraceInstruction::Stack(InstrStack { details, parent }));
             true
         })
     }
 
-    fn handle_malloc(&mut self, ptr: *mut u8, size: usize, trace: &Trace) {
-        let index = self.alloc_index(trace);
-        self.trace_buffer
-            .push(TraceInstruction::Allocate(InstrAllocate {
-                trace_index: index as _,
-                ptr: ptr as _,
-                size,
-            }))
+    fn handle_malloc(&mut self, ptr: u64, size: usize, stop: *mut c_void) {
+        let trace = Trace::new(stop);
+        let trace_index = self.alloc_index(&trace);
+        let allocate = InstrAllocate {
+            trace_index,
+            ptr,
+            size,
+        };
+        self.trace_buffer.push(TraceInstruction::Allocate(allocate))
     }
 
-    fn handle_free(&mut self, ptr: *mut u8) {
-        self.trace_buffer
-            .push(TraceInstruction::Free(InstrFree { ptr: ptr as _ }))
+    fn handle_free(&mut self, ptr: u64, stop: *mut c_void) {
+        let trace = Trace::new(stop);
+        let trace_index = self.alloc_index(&trace);
+        let free = InstrFree { trace_index, ptr };
+        self.trace_buffer.push(TraceInstruction::Free(free))
     }
 }
 
@@ -336,6 +359,10 @@ struct TraceBuffer {
 }
 
 impl TraceBuffer {
+    const fn capacity() -> usize {
+        1024
+    }
+
     fn new(handle: GatherHandle) -> Self {
         Self {
             handle,
@@ -354,8 +381,8 @@ impl TraceBuffer {
     fn push(&mut self, instruction: TraceInstruction) {
         let mut guard = self.buffer.lock().unwrap();
         let buffer = &mut guard.buffer;
-        if buffer.capacity() < 1024 {
-            let to_reserve = 1024 - buffer.capacity();
+        if buffer.capacity() < Self::capacity() {
+            let to_reserve = Self::capacity() - buffer.capacity();
             buffer.reserve(to_reserve);
         }
         buffer.push((instruction, START_TIME.elapsed().as_nanos() as _));

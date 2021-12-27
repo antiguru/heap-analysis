@@ -18,4 +18,13 @@ fn main() {
     let v = vec![1, 2, 3];
     println!("Hello, world! {:?}", v);
     println!("test: {}", test().len());
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    for i in 0..50 {
+        std::thread::spawn(|| {
+            println!("thread id: {:?}", std::thread::current().id());
+            test()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
 }
