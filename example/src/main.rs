@@ -1,7 +1,7 @@
-use heaptrack_rust_track::TrackingAllocator;
+use heap_analysis_track::TrackingAllocator;
 
 #[global_allocator]
-static ALLOC: heaptrack_rust_track::TrackingAllocator = TrackingAllocator;
+static ALLOC: TrackingAllocator<std::alloc::System> = TrackingAllocator(std::alloc::System);
 
 fn test() -> String {
     let mut s = " ".to_owned();
@@ -12,7 +12,7 @@ fn test() -> String {
 }
 
 fn main() {
-    TrackingAllocator::start();
+    ALLOC.start();
     let v = vec![1, 2, 3];
     println!("Hello, world! {:?}", v);
     let v = vec![1, 2, 3];

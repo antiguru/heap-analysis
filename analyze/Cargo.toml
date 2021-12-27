@@ -8,7 +8,7 @@ license = "MIT"
 [dependencies]
 bincode = "1.3"
 crossbeam-channel = "0.5"
-heaptrack-rust-track = { path = "../track" }
+heap-analysis-track = { path = "../track" }
 track-types = { path = "../track-types" }
 serde = "1.0"
 timely = "0.12"

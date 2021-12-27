@@ -1,21 +1,23 @@
 use std::net::TcpListener;
 use std::time::Duration;
 
-use crossbeam_channel::TryRecvError;
+use crossbeam_channel::{bounded, TryRecvError};
 
 use timely::dataflow::operators::generic::source;
 use timely::dataflow::operators::Inspect;
 use timely::scheduling::Scheduler;
 
-use track_types::TraceProtocol;
+use track_types::{TraceProtocol, ENV_HEAP_ANALYSIS_ADDR};
 
 fn main() {
     timely::execute_from_args(std::env::args(), |worker| {
         let mut conn = if worker.index() == 0 {
-            let (sender, receiver) = crossbeam_channel::bounded(64);
+            let (sender, receiver) = bounded(64);
 
             std::thread::spawn(move || {
-                let listener = TcpListener::bind(format!("127.0.0.1:{}", 64123)).unwrap();
+                let addr = std::env::var(ENV_HEAP_ANALYSIS_ADDR);
+                let addr = addr.as_deref().unwrap_or("localhost:64123");
+                let listener = TcpListener::bind(addr).unwrap();
                 let stream = listener.incoming().next().unwrap().unwrap();
                 loop {
                     match bincode::deserialize_from::<_, TraceProtocol>(&stream) {

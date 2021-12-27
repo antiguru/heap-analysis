@@ -1,5 +1,5 @@
 [package]
-name = "heaptrack-rust-track"
+name = "heap-analysis-track"
 version = "0.1.0"
 edition = "2021"
 authors = ["Moritz Hoffmann <antiguru@gmail.com>"]
