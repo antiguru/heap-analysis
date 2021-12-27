@@ -118,18 +118,16 @@ impl Trace {
         data.fill(0 as _);
 
         let mut record = false;
-        unsafe {
-            backtrace::trace_unsynchronized(|frame| {
-                if !record {
-                    let symbol = frame.symbol_address();
-                    record = symbol == stop;
-                } else {
-                    data[index] = frame.ip();
-                    index += 1;
-                }
-                index < data.len()
-            });
-        }
+        backtrace::trace(|frame| {
+            if !record {
+                let symbol = frame.symbol_address();
+                record = symbol == stop;
+            } else {
+                data[index] = frame.ip();
+                index += 1;
+            }
+            index < data.len()
+        });
         let mut size = index;
         while size > 0 && self.data[size - 1].is_null() {
             size -= 1;
