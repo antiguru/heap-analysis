@@ -1,5 +1,17 @@
 use serde::{Deserialize, Serialize};
 
+pub type Timestamp = u64;
+pub type TimestampedTraceInstruction = (TraceInstruction, Timestamp);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TraceProtocol {
+    Instructions {
+        thread_id: usize,
+        buffer: Vec<TimestampedTraceInstruction>,
+    },
+    Timestamp(Timestamp),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TraceInstruction {
     Init(InstrInit),

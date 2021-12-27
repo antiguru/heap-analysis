@@ -7,7 +7,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use lazy_static::lazy_static;
-use track_types::{InstrAllocate, InstrFree, InstrStack};
+use track_types::{
+    InstrAllocate, InstrFree, InstrStack, TimestampedTraceInstruction, TraceProtocol,
+};
 use track_types::{InstrInit, TraceInstruction};
 
 use crate::stacktrace::Trace;
@@ -52,7 +54,7 @@ enum TrackingState {
 
 #[derive(Debug)]
 enum GathererProtocol {
-    Flush(usize, Vec<TraceInstruction>),
+    Flush(usize, Vec<(TraceInstruction, u64)>),
     Register(Arc<Mutex<ThreadState>>),
 }
 
@@ -89,7 +91,7 @@ impl GatherHandle {
             .unwrap();
     }
 
-    fn flush(&self, thread_id: usize, buffer: Vec<TraceInstruction>) {
+    fn flush(&self, thread_id: usize, buffer: Vec<(TraceInstruction, u64)>) {
         self.sender
             .as_ref()
             .expect("Sender exists until drop")
@@ -144,8 +146,8 @@ impl Gatherer {
                                 GathererProtocol::Register(shared_buffer) => {
                                     self.buffers.push(shared_buffer);
                                 },
-                                GathererProtocol::Flush(thread_id, buffer) => {
-                                    self.handle_buffer(thread_id, &buffer);
+                                GathererProtocol::Flush(thread_id, mut buffer) => {
+                                    self.handle_buffer(thread_id, &mut buffer);
                                 },
                             }
                         }
@@ -160,17 +162,37 @@ impl Gatherer {
     }
 
     fn handle_buffers(&mut self) {
+        let time = START_TIME.elapsed().as_nanos() as u64;
+        let mut buffer = Vec::with_capacity(1024);
         for index in 0..self.buffers.len() {
-            let mut guard = self.buffers[index].lock().unwrap();
-            self.handle_buffer(guard.thread_id, &std::mem::take(&mut guard.buffer));
+            // Limit scope of lock to not include sending data over the network
+            let thread_id = {
+                let mut guard = self.buffers[index].lock().unwrap();
+                let position = match guard.buffer.binary_search_by(|x| x.1.cmp(&time)) {
+                    Ok(position) => position + 1,
+                    Err(position) => position,
+                };
+                buffer.extend(guard.buffer.drain(..position));
+                guard.thread_id
+            };
+            self.handle_buffer(thread_id, &mut buffer);
         }
     }
 
-    fn handle_buffer(&self, thread_id: usize, buffer: &[TraceInstruction]) {
+    fn handle_buffer(&self, thread_id: usize, buffer: &mut Vec<TimestampedTraceInstruction>) {
         if buffer.is_empty() {
             return;
         }
-        bincode::serialize_into(&self.connection, &(thread_id, buffer)).unwrap();
+        let protocol = TraceProtocol::Instructions {
+            thread_id,
+            buffer: std::mem::take(buffer),
+        };
+        bincode::serialize_into::<_, TraceProtocol>(&self.connection, &protocol).unwrap();
+        match protocol {
+            TraceProtocol::Instructions { buffer: b, .. } => *buffer = b,
+            _ => {}
+        }
+        buffer.clear();
     }
 }
 
@@ -182,6 +204,7 @@ impl Drop for Gatherer {
 
 lazy_static! {
     static ref GATHER: Mutex<Option<GatherHandle>> = Mutex::new(Some(Default::default()));
+    static ref START_TIME: std::time::Instant = std::time::Instant::now();
 }
 
 static START_TRACKING: AtomicBool = AtomicBool::new(false);
@@ -220,7 +243,7 @@ pub struct AllocationWriter {
 
 #[derive(Debug)]
 struct ThreadState {
-    buffer: Vec<TraceInstruction>,
+    buffer: Vec<(TraceInstruction, u64)>,
     thread_id: usize,
 }
 
@@ -248,20 +271,20 @@ impl TraceBuffer {
 
     fn init(&mut self) {
         self.handle.register(self.buffer.clone());
-        self.trace(TraceInstruction::Init(InstrInit {
+        self.push(TraceInstruction::Init(InstrInit {
             thread_name: format!("{:?}", std::thread::current().id().to_owned()),
             thread_id: thread_id::get(),
         }))
     }
 
-    fn trace(&mut self, instruction: TraceInstruction) {
+    fn push(&mut self, instruction: TraceInstruction) {
         let mut guard = self.buffer.lock().unwrap();
         let buffer = &mut guard.buffer;
         if buffer.capacity() < 1024 {
             let to_reserve = 1024 - buffer.capacity();
             buffer.reserve(to_reserve);
         }
-        buffer.push(instruction);
+        buffer.push((instruction, START_TIME.elapsed().as_nanos() as _));
         if buffer.len() == buffer.capacity() {
             let buffer = std::mem::take(&mut *buffer);
             self.handle.flush(guard.thread_id, buffer);
@@ -296,14 +319,14 @@ impl AllocationWriter {
                 });
             }
             let symbol = symbol.unwrap_or_else(|| "<unresolved>".to_owned());
-            trace_buffer.trace(TraceInstruction::Stack(InstrStack {
+            trace_buffer.push(TraceInstruction::Stack(InstrStack {
                 name: symbol,
                 parent: index as _,
             }));
             true
         });
         self.trace_buffer
-            .trace(TraceInstruction::Allocate(InstrAllocate {
+            .push(TraceInstruction::Allocate(InstrAllocate {
                 trace_index: index as _,
                 ptr: ptr as _,
                 size,
@@ -312,6 +335,6 @@ impl AllocationWriter {
 
     pub fn handle_free(&mut self, ptr: *mut u8) {
         self.trace_buffer
-            .trace(TraceInstruction::Free(InstrFree { ptr: ptr as _ }))
+            .push(TraceInstruction::Free(InstrFree { ptr: ptr as _ }))
     }
 }
