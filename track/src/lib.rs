@@ -3,21 +3,21 @@
 #![forbid(missing_docs)]
 
 use std::alloc::{GlobalAlloc, Layout};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crossbeam_channel::{select, tick, unbounded, Receiver, Sender};
+use crossbeam_channel::{select, tick, unbounded, Receiver, Sender, TryRecvError};
 
 use lazy_static::lazy_static;
 use libc::c_void;
 
 use track_types::{
-    InstrAllocate, InstrFree, InstrInit, InstrStack, InstrStackDetails,
-    TimestampedTraceInstruction, TraceInstruction, TraceProtocol, ENV_HEAP_ANALYSIS_ADDR,
+    InstrAllocation, InstrInit, InstrStack, InstrStackDetails, TimestampedTraceInstruction,
+    TraceInstruction, TraceProtocol, ENV_HEAP_ANALYSIS_ADDR,
 };
 
 use crate::stacktrace::Trace;
@@ -40,6 +40,8 @@ lazy_static! {
     static ref GATHER: Mutex<Option<GatherHandle>> = Mutex::new(Some(Default::default()));
     /// Start time
     static ref START_TIME: std::time::Instant = std::time::Instant::now();
+    /// Coordination lock
+    static ref REGISTRATION_LOCK: RwLock<()> = Default::default();
 }
 
 /// Is tracking enabled?
@@ -55,7 +57,9 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for TrackingAllocator<A> {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        AllocationWriter::writer(|writer| writer.handle_free(ptr as _, Self::dealloc as _));
+        AllocationWriter::writer(|writer| {
+            writer.handle_dealloc(ptr as _, layout.size(), Self::dealloc as _)
+        });
         self.0.dealloc(ptr, layout)
     }
 }
@@ -162,7 +166,7 @@ impl Drop for GatherHandle {
 /// State of the gatherer thread
 struct Gatherer {
     /// Shared handle to the thread states.
-    buffers: Vec<Arc<Mutex<ThreadState>>>,
+    buffers: Cell<Vec<Arc<Mutex<ThreadState>>>>,
     /// Receive endpoint to get push updates from threads.
     receiver: Receiver<GathererProtocol>,
     /// Sink to write data
@@ -187,20 +191,7 @@ impl Gatherer {
             select! {
                 recv(self.receiver) -> msg => {
                     match msg {
-                       Ok(protocol) => {
-                            match protocol {
-                                GathererProtocol::Register(shared_buffer, condvar) => {
-                                    self.buffers.push(shared_buffer);
-                                    let (lock, signal) = &*condvar;
-                                    let mut started = lock.lock().unwrap();
-                                    *started = true;
-                                    signal.notify_one();
-                                },
-                                GathererProtocol::Flush(thread_id, mut buffer) => {
-                                    self.send_buffer(thread_id, &mut buffer);
-                                },
-                            }
-                        }
+                       Ok(protocol) => self.handle_protocol(protocol),
                         Err(_) => break,
                     }
                 },
@@ -211,21 +202,50 @@ impl Gatherer {
         }
     }
 
+    fn handle_protocol(&mut self, protocol: GathererProtocol) {
+        match protocol {
+            GathererProtocol::Register(shared_buffer, condvar) => {
+                self.buffers.get_mut().push(shared_buffer);
+                let (lock, signal) = &*condvar;
+                let mut started = lock.lock().unwrap();
+                *started = true;
+                signal.notify_one();
+            }
+            GathererProtocol::Flush(thread_id, mut buffer) => {
+                self.send_buffer(thread_id, &mut buffer);
+            }
+        }
+    }
+
+    fn try_recv(&mut self) -> Result<(), crossbeam_channel::TryRecvError> {
+        loop {
+            match self.receiver.try_recv() {
+                Ok(protocol) => self.handle_protocol(protocol),
+                Err(TryRecvError::Disconnected) => return Err(TryRecvError::Disconnected),
+                Err(TryRecvError::Empty) => break,
+            }
+        }
+        Ok(())
+    }
+
     /// Forcibly flush buffers from worker threads
     fn handle_buffers(&mut self) {
+        let _coordination_lock = REGISTRATION_LOCK.write();
+        let _ = self.try_recv();
         let time = START_TIME.elapsed().as_nanos() as u64;
         let mut buffer = Vec::with_capacity(TraceBuffer::capacity());
-        for index in 0..self.buffers.len() {
+        let states = self.buffers.take();
+        for state in &states {
             // Limit scope of lock to not include sending data over the network
             let thread_id = {
-                let mut guard = self.buffers[index].lock().unwrap();
-                // Determine all data recorded before `time`
-                let position = guard.buffer.partition_point(|x| x.1 < time);
-                buffer.extend(guard.buffer.drain(..position));
+                let mut guard = state.lock().unwrap();
+                let _ = self.try_recv();
+                std::mem::swap(&mut buffer, &mut guard.buffer);
                 guard.thread_id
             };
             self.send_buffer(thread_id, &mut buffer);
         }
+        self.buffers.set(states);
         bincode::serialize_into::<_, TraceProtocol>(
             &self.connection,
             &TraceProtocol::Timestamp(time),
@@ -322,7 +342,7 @@ impl AllocationWriter {
     fn handle_malloc(&mut self, ptr: u64, size: usize, stop: *mut c_void) {
         let trace = Trace::new(stop);
         let trace_index = self.alloc_index(&trace);
-        let allocate = InstrAllocate {
+        let allocate = InstrAllocation {
             trace_index,
             ptr,
             size,
@@ -330,11 +350,15 @@ impl AllocationWriter {
         self.trace_buffer.push(TraceInstruction::Allocate(allocate))
     }
 
-    fn handle_free(&mut self, ptr: u64, stop: *mut c_void) {
+    fn handle_dealloc(&mut self, ptr: u64, size: usize, stop: *mut c_void) {
         let trace = Trace::new(stop);
         let trace_index = self.alloc_index(&trace);
-        let free = InstrFree { trace_index, ptr };
-        self.trace_buffer.push(TraceInstruction::Free(free))
+        let free = InstrAllocation {
+            trace_index,
+            ptr,
+            size,
+        };
+        self.trace_buffer.push(TraceInstruction::Deallocate(free))
     }
 }
 
@@ -371,6 +395,7 @@ impl TraceBuffer {
     }
 
     fn init(&mut self) {
+        let _coordination_lock = REGISTRATION_LOCK.read();
         self.handle.register(self.buffer.clone());
         self.push(TraceInstruction::Init(InstrInit {
             thread_name: format!("{:?}", std::thread::current().id().to_owned()),

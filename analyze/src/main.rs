@@ -5,12 +5,11 @@ use crossbeam_channel::{bounded, TryRecvError};
 use timely::dataflow::channels::pact::Pipeline;
 
 use timely::dataflow::operators::generic::source;
-use timely::dataflow::operators::{Inspect, Operator};
+use timely::dataflow::operators::Operator;
 use timely::scheduling::Scheduler;
 
-use track_types::{
-    InstrAllocate, InstrFree, TraceInstruction, TraceProtocol, ENV_HEAP_ANALYSIS_ADDR,
-};
+use crate::merge::Merger;
+use track_types::{InstrAllocation, TraceInstruction, TraceProtocol, ENV_HEAP_ANALYSIS_ADDR};
 
 fn main() {
     timely::execute_from_args(std::env::args(), |worker| {
@@ -59,7 +58,7 @@ fn main() {
                                 }) => {
                                     let mut data = buffer
                                         .drain(..)
-                                        .map(|(data, time)| ((thread_id, data), time))
+                                        .map(|(data, time)| (time, (thread_id, data)))
                                         .collect();
                                     output.session(&cap).give_vec(&mut data);
                                 }
@@ -80,48 +79,244 @@ fn main() {
             });
             trace
                 .unary_notify(Pipeline, "alloc per thread", None, {
-                    let mut stash: HashMap<u64, HashMap<usize, (usize, usize)>> = HashMap::new();
-                    let mut allocated: HashMap<u64, (usize, usize)> = Default::default();
+                    // time -> thread_id -> (alloc'ed, dealloc'ed)
+                    // time -> (alloc_thread_id, dealloc_thread_id, alloc_trace_index, dealloc_trace_index) -> (alloc'ed, dealloc'ed, alloc count, dealloc count)
+                    let mut aggregation: HashMap<
+                        u64,
+                        HashMap<(usize, usize, usize, usize), (usize, usize)>,
+                    > = HashMap::new();
+                    // ptr -> (thread_id, size, trace_index)
+                    let mut allocated: HashMap<u64, (usize, usize, usize)> = Default::default();
+                    let mut merger: Merger<Vec<(u64, (usize, TraceInstruction))>> =
+                        Default::default();
+                    let mut last_ts = 0;
                     move |input, output, not| {
                         while let Some((time, data)) = input.next() {
-                            let timed = stash.entry(*&*time).or_default();
+                            merger.push(data.replace(Default::default()));
                             not.notify_at(time.retain());
-                            for ((thread_id, data), _timestamp_ns) in &*data {
+                        }
+                        for (time, _) in not.by_ref() {
+                            let timed = aggregation.entry(*time.time()).or_default();
+                            while merger
+                                .peek()
+                                .map(|head| head.0 < *time.time())
+                                .unwrap_or(false)
+                            {
+                                let (_timestamp_ns, (thread_id, data)) = merger.next().unwrap();
+                                assert!(last_ts <= _timestamp_ns);
+                                last_ts = _timestamp_ns;
                                 match data {
                                     TraceInstruction::Init(_) => {}
                                     TraceInstruction::Stack(_) => {}
-                                    TraceInstruction::Allocate(InstrAllocate {
-                                        size, ptr, ..
+                                    TraceInstruction::Allocate(InstrAllocation {
+                                        size,
+                                        ptr,
+                                        trace_index,
                                     }) => {
-                                        timed.entry(*thread_id).or_default().0 += size;
-                                        allocated.insert(*ptr, (*thread_id, *size));
+                                        allocated.insert(ptr, (thread_id, size, trace_index));
                                     }
-                                    TraceInstruction::Free(InstrFree { ptr, .. }) => {
-                                        if let Some((thread_id, size)) = allocated.remove(ptr) {
-                                            timed.entry(thread_id).or_default().1 += size;
+                                    TraceInstruction::Deallocate(InstrAllocation {
+                                        ptr,
+                                        size: _,
+                                        trace_index,
+                                    }) => {
+                                        if let Some((alloc_thread_id, size, alloc_trace_index)) =
+                                            allocated.remove(&ptr)
+                                        {
+                                            let entry = timed
+                                                .entry((
+                                                    alloc_thread_id,
+                                                    thread_id,
+                                                    alloc_trace_index,
+                                                    trace_index,
+                                                ))
+                                                .or_default();
+                                            entry.0 += size;
+                                            entry.1 += 1;
                                         } else {
                                             eprintln!("Free without allocation: {:0x}", ptr);
                                         }
                                     }
                                 }
                             }
-                        }
-                        while let Some((time, _)) = not.next() {
-                            for (thread_id, (alloced, freeed)) in
-                                stash.remove(time.time()).unwrap_or_default().into_iter()
+
+                            for (thread_id, (alloced, freeed)) in aggregation
+                                .remove(time.time())
+                                .unwrap_or_default()
+                                .into_iter()
+                                .filter(|(key, _)| key.0 != key.1)
                             {
                                 output.session(&time).give((thread_id, alloced, freeed));
                             }
                         }
                     }
                 })
-                .inspect_time(|time, (thread_id, alloced, freeed)| {
-                    println!(
-                        "[{}] thread: {}, alloced: {}, freeed: {}",
-                        time, thread_id, alloced, freeed
-                    );
+                .sink(Pipeline, "sink", {
+                    let mut buffer = Default::default();
+                    move |input| {
+                        while let Some((time, data)) = input.next() {
+                            data.swap(&mut buffer);
+                            buffer.sort_by_key(|(_thread_id, _alloced, freeed)| *freeed);
+                            println!("[{}]", time.time());
+                            for (thread_id, alloced, freeed) in buffer.drain(..) {
+                                println!(
+                                    "\tthread: {:?}, alloced: {}, freeed: {}",
+                                    thread_id, alloced, freeed
+                                );
+                            }
+                        }
+                    }
                 });
         })
     })
     .unwrap(); // asserts error-free execution
+}
+
+mod merge {
+    use std::cmp::{Ordering, Reverse};
+    use std::collections::BinaryHeap;
+
+    struct Head<I: Iterator>(I, I::Item);
+
+    impl<I: Iterator> Eq for Head<I> where I::Item: Eq {}
+
+    impl<I: Iterator> PartialEq for Head<I>
+    where
+        I::Item: Eq,
+    {
+        fn eq(&self, other: &Self) -> bool {
+            self.1.eq(&other.1)
+        }
+    }
+
+    impl<I: Iterator> PartialOrd for Head<I>
+    where
+        I::Item: Eq + PartialOrd,
+    {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            self.1.partial_cmp(&other.1)
+        }
+    }
+
+    impl<I: Iterator> Ord for Head<I>
+    where
+        I::Item: Ord,
+    {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.1.cmp(&other.1)
+        }
+    }
+
+    pub struct Merger<I: IntoIterator> {
+        iters: BinaryHeap<Reverse<Head<I::IntoIter>>>,
+    }
+
+    impl<I: IntoIterator> Merger<I>
+    where
+        I::Item: Ord,
+    {
+        fn maybe_push(&mut self, mut iter: I::IntoIter) {
+            if let Some(next) = iter.next() {
+                self.iters.push(Reverse(Head(iter, next)));
+            }
+        }
+    }
+
+    impl<I: IntoIterator> Default for Merger<I>
+    where
+        I::Item: Ord,
+    {
+        fn default() -> Self {
+            Self {
+                iters: Default::default(),
+            }
+        }
+    }
+
+    impl<I: IntoIterator> Extend<I> for Merger<I>
+    where
+        I::Item: Ord,
+    {
+        fn extend<Is: IntoIterator<Item = I>>(&mut self, things: Is) {
+            self.iters.extend(things.into_iter().flat_map(|into_iter| {
+                let mut iter = into_iter.into_iter();
+                iter.next().map(|next| Reverse(Head(iter, next)))
+            }))
+        }
+    }
+
+    impl<I: IntoIterator> Merger<I>
+    where
+        I::Item: Ord,
+    {
+        pub fn push(&mut self, into_iter: I) {
+            self.maybe_push(into_iter.into_iter());
+        }
+
+        pub fn peek(&mut self) -> Option<&I::Item> {
+            self.iters.peek().map(|head| &(head.0).1)
+        }
+    }
+
+    impl<I: IntoIterator> Iterator for Merger<I>
+    where
+        I::Item: Ord,
+    {
+        type Item = I::Item;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if let Some(Reverse(Head(iter, item))) = self.iters.pop() {
+                self.maybe_push(iter);
+                Some(item)
+            } else {
+                None
+            }
+        }
+    }
+
+    impl<I: IntoIterator> From<Vec<I>> for Merger<I>
+    where
+        I::Item: Ord,
+    {
+        fn from(elements: Vec<I>) -> Self {
+            let mut merger = Merger::default();
+            merger.extend(elements.into_iter());
+            merger
+        }
+    }
+
+    impl<I: IntoIterator> FromIterator<I> for Merger<I>
+    where
+        I::Item: Ord,
+    {
+        #[inline]
+        fn from_iter<II: IntoIterator<Item = I>>(iter: II) -> Self {
+            let mut merger = Merger::default();
+            merger.extend(iter.into_iter());
+            merger
+        }
+    }
+
+    #[cfg(test)]
+    mod test {
+        use crate::Merger;
+
+        #[test]
+        fn one_element() {
+            let mut merger: Merger<_> = Some(vec![1]).into_iter().collect();
+            assert_eq!(merger.next(), Some(1));
+            assert_eq!(merger.next(), None);
+        }
+        #[test]
+        fn two_elements() {
+            let mut merger: Merger<_> = [vec![0], vec![1]].into_iter().collect();
+            assert_eq!(merger.next(), Some(0));
+            assert_eq!(merger.next(), Some(1));
+            assert_eq!(merger.next(), None);
+            let mut merger: Merger<_> = [vec![1], vec![0]].into_iter().collect();
+            assert_eq!(merger.next(), Some(0));
+            assert_eq!(merger.next(), Some(1));
+            assert_eq!(merger.next(), None);
+        }
+    }
 }

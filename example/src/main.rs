@@ -20,7 +20,7 @@ fn main() {
     println!("test: {}", test().len());
     std::thread::sleep(std::time::Duration::from_millis(100));
 
-    for i in 0..50 {
+    for _ in 0..50 {
         std::thread::spawn(|| {
             println!("thread id: {:?}", std::thread::current().id());
             test()

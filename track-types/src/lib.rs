@@ -29,20 +29,20 @@ pub enum TraceProtocol {
 }
 
 /// A choice of trace instructions
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Ord, PartialOrd, Eq, PartialEq)]
 pub enum TraceInstruction {
     /// Initialize instruction, only send once
     Init(InstrInit),
     /// Stack frame update
     Stack(InstrStack),
     /// Allocate memory
-    Allocate(InstrAllocate),
+    Allocate(InstrAllocation),
     /// Free memory
-    Free(InstrFree),
+    Deallocate(InstrAllocation),
 }
 
 /// Initialization instruction
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Ord, PartialOrd, Eq, PartialEq)]
 pub struct InstrInit {
     /// Human-readable name of the thread
     pub thread_name: String,
@@ -54,7 +54,7 @@ pub struct InstrInit {
 ///
 /// Stack frames are a thread-local tree that reference a parent stack frame. The number references
 /// the n-th chronological frame on the same thread.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Ord, PartialOrd, Eq, PartialEq)]
 pub struct InstrStack {
     /// Resolved symbol, heap-allocated to reduce the size of [TraceInstruction]
     pub details: Box<InstrStackDetails>,
@@ -65,7 +65,7 @@ pub struct InstrStack {
 /// Symbol details
 ///
 /// The availability of some data depends on debug information, especially filename/lineno/colno.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, Ord, PartialOrd, Eq, PartialEq)]
 pub struct InstrStackDetails {
     /// Name of the symbol.
     pub name: Option<String>,
@@ -78,19 +78,10 @@ pub struct InstrStackDetails {
 }
 
 /// Announce a memory allocation
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InstrAllocate {
+#[derive(Debug, Clone, Serialize, Deserialize, Ord, PartialOrd, Eq, PartialEq)]
+pub struct InstrAllocation {
     /// Size of the allocation
     pub size: usize,
-    /// Pointer
-    pub ptr: u64,
-    /// Stack frame
-    pub trace_index: usize,
-}
-
-/// Announce freeing of mememory
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InstrFree {
     /// Pointer
     pub ptr: u64,
     /// Stack frame
