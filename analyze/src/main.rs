@@ -1,15 +1,23 @@
-use std::collections::HashMap;
+use bincode::Options;
+use std::io::BufReader;
 use std::net::TcpListener;
 
 use crossbeam_channel::{bounded, TryRecvError};
 use timely::dataflow::channels::pact::Pipeline;
 
 use timely::dataflow::operators::generic::source;
-use timely::dataflow::operators::Operator;
+use timely::dataflow::operators::{Map, Operator};
 use timely::scheduling::Scheduler;
 
-use crate::merge::Merger;
-use track_types::{InstrAllocation, TraceInstruction, TraceProtocol, ENV_HEAP_ANALYSIS_ADDR};
+use differential_dataflow::difference::DiffPair;
+use differential_dataflow::operators::arrange::Arrange;
+use differential_dataflow::operators::Count;
+use differential_dataflow::trace::implementations::ord::OrdValSpine;
+use differential_dataflow::trace::{BatchReader, Cursor};
+use differential_dataflow::AsCollection;
+use timely::dataflow::scopes::Child;
+
+use track_types::{TraceInstruction, TraceProtocol, ENV_HEAP_ANALYSIS_ADDR};
 
 fn main() {
     timely::execute_from_args(std::env::args(), |worker| {
@@ -25,8 +33,12 @@ fn main() {
                         let addr = addr.as_deref().unwrap_or("localhost:64123");
                         let listener = TcpListener::bind(addr).unwrap();
                         let stream = listener.incoming().next().unwrap().unwrap();
+                        let mut stream = BufReader::new(stream);
                         loop {
-                            match bincode::deserialize_from::<_, TraceProtocol>(&stream) {
+                            match bincode::options()
+                                .with_varint_encoding()
+                                .deserialize_from::<_, TraceProtocol>(&mut stream)
+                            {
                                 Ok(data) => {
                                     sender.send(data).unwrap();
                                     activator.activate().unwrap();
@@ -62,6 +74,7 @@ fn main() {
                                         .collect();
                                     output.session(&cap).give_vec(&mut data);
                                 }
+                                Ok(TraceProtocol::Init(_info)) => {}
                                 Ok(TraceProtocol::Timestamp(timestamp)) => {
                                     cap.downgrade(&timestamp);
                                 }
@@ -77,246 +90,63 @@ fn main() {
                     }
                 }
             });
-            trace
-                .unary_notify(Pipeline, "alloc per thread", None, {
-                    // time -> thread_id -> (alloc'ed, dealloc'ed)
-                    // time -> (alloc_thread_id, dealloc_thread_id, alloc_trace_index, dealloc_trace_index) -> (alloc'ed, dealloc'ed, alloc count, dealloc count)
-                    let mut aggregation: HashMap<
-                        u64,
-                        HashMap<(usize, usize, usize, usize), (usize, usize)>,
-                    > = HashMap::new();
-                    // ptr -> (thread_id, size, trace_index)
-                    let mut allocated: HashMap<u64, (usize, usize, usize)> = Default::default();
-                    let mut merger: Merger<Vec<(u64, (usize, TraceInstruction))>> =
-                        Default::default();
-                    let mut last_ts = 0;
-                    move |input, output, not| {
-                        while let Some((time, data)) = input.next() {
-                            merger.push(data.replace(Default::default()));
-                            not.notify_at(time.retain());
-                        }
-                        for (time, _) in not.by_ref() {
-                            let timed = aggregation.entry(*time.time()).or_default();
-                            while merger
-                                .peek()
-                                .map(|head| head.0 < *time.time())
-                                .unwrap_or(false)
-                            {
-                                let (_timestamp_ns, (thread_id, data)) = merger.next().unwrap();
-                                assert!(last_ts <= _timestamp_ns);
-                                last_ts = _timestamp_ns;
-                                match data {
-                                    TraceInstruction::Init(_) => {}
-                                    TraceInstruction::Stack(_) => {}
-                                    TraceInstruction::Allocate(InstrAllocation {
-                                        size,
-                                        ptr,
-                                        trace_index,
-                                    }) => {
-                                        allocated.insert(ptr, (thread_id, size, trace_index));
+            let collection = trace
+                .flat_map(|(time, (thread_id, instr))| {
+                    let diff: isize = match &instr {
+                        TraceInstruction::Stack(_) => 0,
+                        TraceInstruction::Allocate(_) => 1,
+                        TraceInstruction::Deallocate(_) => -1,
+                    };
+                    instr.ptr().map(|ptr| {
+                        (
+                            (ptr, (time, thread_id, instr.trace_index().unwrap())),
+                            time,
+                            DiffPair::new(diff, instr.size().unwrap() as isize * diff),
+                        )
+                    })
+                })
+                .as_collection();
+            let arranged = Arrange::<Child<_, u64>, _, (_, _, _), _>::arrange::<
+                OrdValSpine<_, _, _, _>,
+            >(&collection);
+            let accum = arranged
+                .stream
+                .unary(Pipeline, "accumulatable", |_cap, _info| {
+                    move |input, output| {
+                        input.for_each(|time, data| {
+                            let mut session = output.session(&time);
+                            for wrapper in data.iter() {
+                                let batch = &wrapper;
+                                let mut cursor = batch.cursor();
+                                while let Some(_key) = cursor.get_key(batch) {
+                                    // println!("k: {:x}", key);
+                                    while let Some((_time, thread_id, _trace_index)) =
+                                        cursor.get_val(batch)
+                                    {
+                                        cursor.map_times(batch, |_time, diff| {
+                                            if diff.element1 > 0 {
+                                                session.give((*thread_id, *time.time(), *diff));
+                                            }
+                                            // println!("\tv: {:?}, t: {}, d: {:?}", val, time, diff,);
+                                        });
+                                        cursor.step_val(batch);
                                     }
-                                    TraceInstruction::Deallocate(InstrAllocation {
-                                        ptr,
-                                        size: _,
-                                        trace_index,
-                                    }) => {
-                                        if let Some((alloc_thread_id, size, alloc_trace_index)) =
-                                            allocated.remove(&ptr)
-                                        {
-                                            let entry = timed
-                                                .entry((
-                                                    alloc_thread_id,
-                                                    thread_id,
-                                                    alloc_trace_index,
-                                                    trace_index,
-                                                ))
-                                                .or_default();
-                                            entry.0 += size;
-                                            entry.1 += 1;
-                                        } else {
-                                            eprintln!("Free without allocation: {:0x}", ptr);
-                                        }
-                                    }
+                                    cursor.step_key(batch);
                                 }
                             }
-
-                            for (thread_id, (alloced, freeed)) in aggregation
-                                .remove(time.time())
-                                .unwrap_or_default()
-                                .into_iter()
-                                .filter(|(key, _)| key.0 != key.1)
-                            {
-                                output.session(&time).give((thread_id, alloced, freeed));
-                            }
-                        }
+                        });
                     }
                 })
-                .sink(Pipeline, "sink", {
-                    let mut buffer = Default::default();
-                    move |input| {
-                        while let Some((time, data)) = input.next() {
-                            data.swap(&mut buffer);
-                            buffer.sort_by_key(|(_thread_id, _alloced, freeed)| *freeed);
-                            println!("[{}]", time.time());
-                            for (thread_id, alloced, freeed) in buffer.drain(..) {
-                                println!(
-                                    "\tthread: {:?}, alloced: {}, freeed: {}",
-                                    thread_id, alloced, freeed
-                                );
-                            }
-                        }
-                    }
-                });
+                .as_collection();
+            let accum_arranged =
+                Arrange::<Child<_, u64>, _, (), _>::arrange::<OrdValSpine<_, _, _, _>>(&accum);
+            accum_arranged.count().inspect(|(data, time, diff)| {
+                println!(
+                    "thread: {}, allocations: {:?}, sum size: {}, time: {:?}, diff: {}",
+                    data.0, data.1.element1, data.1.element2, time, diff,
+                );
+            });
         })
     })
     .unwrap(); // asserts error-free execution
-}
-
-mod merge {
-    use std::cmp::{Ordering, Reverse};
-    use std::collections::BinaryHeap;
-
-    struct Head<I: Iterator>(I, I::Item);
-
-    impl<I: Iterator> Eq for Head<I> where I::Item: Eq {}
-
-    impl<I: Iterator> PartialEq for Head<I>
-    where
-        I::Item: Eq,
-    {
-        fn eq(&self, other: &Self) -> bool {
-            self.1.eq(&other.1)
-        }
-    }
-
-    impl<I: Iterator> PartialOrd for Head<I>
-    where
-        I::Item: Eq + PartialOrd,
-    {
-        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-            self.1.partial_cmp(&other.1)
-        }
-    }
-
-    impl<I: Iterator> Ord for Head<I>
-    where
-        I::Item: Ord,
-    {
-        fn cmp(&self, other: &Self) -> Ordering {
-            self.1.cmp(&other.1)
-        }
-    }
-
-    pub struct Merger<I: IntoIterator> {
-        iters: BinaryHeap<Reverse<Head<I::IntoIter>>>,
-    }
-
-    impl<I: IntoIterator> Merger<I>
-    where
-        I::Item: Ord,
-    {
-        fn maybe_push(&mut self, mut iter: I::IntoIter) {
-            if let Some(next) = iter.next() {
-                self.iters.push(Reverse(Head(iter, next)));
-            }
-        }
-    }
-
-    impl<I: IntoIterator> Default for Merger<I>
-    where
-        I::Item: Ord,
-    {
-        fn default() -> Self {
-            Self {
-                iters: Default::default(),
-            }
-        }
-    }
-
-    impl<I: IntoIterator> Extend<I> for Merger<I>
-    where
-        I::Item: Ord,
-    {
-        fn extend<Is: IntoIterator<Item = I>>(&mut self, things: Is) {
-            self.iters.extend(things.into_iter().flat_map(|into_iter| {
-                let mut iter = into_iter.into_iter();
-                iter.next().map(|next| Reverse(Head(iter, next)))
-            }))
-        }
-    }
-
-    impl<I: IntoIterator> Merger<I>
-    where
-        I::Item: Ord,
-    {
-        pub fn push(&mut self, into_iter: I) {
-            self.maybe_push(into_iter.into_iter());
-        }
-
-        pub fn peek(&mut self) -> Option<&I::Item> {
-            self.iters.peek().map(|head| &(head.0).1)
-        }
-    }
-
-    impl<I: IntoIterator> Iterator for Merger<I>
-    where
-        I::Item: Ord,
-    {
-        type Item = I::Item;
-
-        fn next(&mut self) -> Option<Self::Item> {
-            if let Some(Reverse(Head(iter, item))) = self.iters.pop() {
-                self.maybe_push(iter);
-                Some(item)
-            } else {
-                None
-            }
-        }
-    }
-
-    impl<I: IntoIterator> From<Vec<I>> for Merger<I>
-    where
-        I::Item: Ord,
-    {
-        fn from(elements: Vec<I>) -> Self {
-            let mut merger = Merger::default();
-            merger.extend(elements.into_iter());
-            merger
-        }
-    }
-
-    impl<I: IntoIterator> FromIterator<I> for Merger<I>
-    where
-        I::Item: Ord,
-    {
-        #[inline]
-        fn from_iter<II: IntoIterator<Item = I>>(iter: II) -> Self {
-            let mut merger = Merger::default();
-            merger.extend(iter.into_iter());
-            merger
-        }
-    }
-
-    #[cfg(test)]
-    mod test {
-        use crate::Merger;
-
-        #[test]
-        fn one_element() {
-            let mut merger: Merger<_> = Some(vec![1]).into_iter().collect();
-            assert_eq!(merger.next(), Some(1));
-            assert_eq!(merger.next(), None);
-        }
-        #[test]
-        fn two_elements() {
-            let mut merger: Merger<_> = [vec![0], vec![1]].into_iter().collect();
-            assert_eq!(merger.next(), Some(0));
-            assert_eq!(merger.next(), Some(1));
-            assert_eq!(merger.next(), None);
-            let mut merger: Merger<_> = [vec![1], vec![0]].into_iter().collect();
-            assert_eq!(merger.next(), Some(0));
-            assert_eq!(merger.next(), Some(1));
-            assert_eq!(merger.next(), None);
-        }
-    }
 }

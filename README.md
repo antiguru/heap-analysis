@@ -35,7 +35,6 @@ symbol `HEAP_ANALYSIS_ADDR`.
 
 ## Limitations
 
-* No detection for stopped threads. The current `thread_id` can be recycled. It is only unique amongst other concurrent
-  threads.
+* Thread terminations are not communicated to analysis layer.
 * All serialization is performed by a single thread. This thread can bottleneck the outgoing data.
 * Obtaining the backtrace is slow. It gets slightly faster once all symbols have been resolved.

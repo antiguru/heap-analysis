@@ -14,6 +14,22 @@ pub type Timestamp = u64;
 /// A timestamped trace instruction.
 pub type TimestampedTraceInstruction = (TraceInstruction, Timestamp);
 
+/// Trace index type.
+#[derive(Debug, Default, Copy, Clone, Serialize, Deserialize, Ord, PartialOrd, Eq, PartialEq)]
+pub struct TraceIndex(pub u32);
+
+impl From<u32> for TraceIndex {
+    fn from(trace_index: u32) -> Self {
+        Self(trace_index)
+    }
+}
+
+impl From<usize> for TraceIndex {
+    fn from(trace_index: usize) -> Self {
+        Self(trace_index as u32)
+    }
+}
+
 /// Tracing protocol. Core wire format
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TraceProtocol {
@@ -26,19 +42,51 @@ pub enum TraceProtocol {
     },
     /// Update the time. All data up to this point has been shipped.
     Timestamp(Timestamp),
+    /// Initialize instruction, only send once
+    Init(InstrInit),
 }
 
 /// A choice of trace instructions
 #[derive(Debug, Clone, Serialize, Deserialize, Ord, PartialOrd, Eq, PartialEq)]
 pub enum TraceInstruction {
-    /// Initialize instruction, only send once
-    Init(InstrInit),
     /// Stack frame update
     Stack(InstrStack),
     /// Allocate memory
     Allocate(InstrAllocation),
     /// Free memory
     Deallocate(InstrAllocation),
+}
+
+impl TraceInstruction {
+    /// Obtain the pointer this instruction references, if any.
+    pub fn ptr(&self) -> Option<u64> {
+        match self {
+            TraceInstruction::Stack(_) => None,
+            TraceInstruction::Allocate(instr) | TraceInstruction::Deallocate(instr) => {
+                Some(instr.ptr)
+            }
+        }
+    }
+
+    /// Obtain the trace index, if any.
+    pub fn trace_index(&self) -> Option<TraceIndex> {
+        match self {
+            TraceInstruction::Stack(_) => None,
+            TraceInstruction::Allocate(instr) | TraceInstruction::Deallocate(instr) => {
+                Some(instr.trace_index)
+            }
+        }
+    }
+
+    /// Obtain the allocation size, if any.
+    pub fn size(&self) -> Option<usize> {
+        match self {
+            TraceInstruction::Stack(_) => None,
+            TraceInstruction::Allocate(instr) | TraceInstruction::Deallocate(instr) => {
+                Some(instr.size)
+            }
+        }
+    }
 }
 
 /// Initialization instruction
@@ -56,8 +104,10 @@ pub struct InstrInit {
 /// the n-th chronological frame on the same thread.
 #[derive(Debug, Clone, Serialize, Deserialize, Ord, PartialOrd, Eq, PartialEq)]
 pub struct InstrStack {
+    /// Instruction pointer on the stack.
+    pub ip: u64,
     /// Resolved symbol, heap-allocated to reduce the size of [TraceInstruction]
-    pub details: Box<InstrStackDetails>,
+    pub details: Option<Box<InstrStackDetails>>,
     /// Number of the parent stack frame
     pub parent: usize,
 }
@@ -85,5 +135,5 @@ pub struct InstrAllocation {
     /// Pointer
     pub ptr: u64,
     /// Stack frame
-    pub trace_index: usize,
+    pub trace_index: TraceIndex,
 }

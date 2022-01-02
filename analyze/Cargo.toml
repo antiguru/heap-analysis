@@ -8,7 +8,8 @@ license = "MIT"
 [dependencies]
 bincode = "1.3"
 crossbeam-channel = "0.5"
+differential-dataflow = "0.12"
 heap-analysis-track = { path = "../track" }
-track-types = { path = "../track-types" }
 serde = "1.0"
-timely = "0.12"
+timely = { version  = "0.12", features = ["bincode"] }
+track-types = { path = "../track-types" }
