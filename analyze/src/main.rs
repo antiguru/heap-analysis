@@ -24,39 +24,43 @@ fn main() {
         worker.dataflow::<u64, _, _>(|scope| {
             let index = scope.index();
             let trace = source(scope, "Trace reader", |cap, info| {
-                let activator = scope.sync_activator_for(&info.address[..]);
                 let mut state = if index == 0 {
+                    let activator = scope.sync_activator_for(&info.address[..]);
                     let (sender, receiver) = bounded(64);
 
-                    std::thread::spawn(move || {
-                        let addr = std::env::var(ENV_HEAP_ANALYSIS_ADDR);
-                        let addr = addr.as_deref().unwrap_or("localhost:64123");
-                        let listener = TcpListener::bind(addr).unwrap();
-                        let stream = listener.incoming().next().unwrap().unwrap();
-                        let mut stream = BufReader::new(stream);
-                        loop {
-                            match bincode::options()
-                                .with_varint_encoding()
-                                .deserialize_from::<_, TraceProtocol>(&mut stream)
-                            {
-                                Ok(data) => {
-                                    sender.send(data).unwrap();
-                                    activator.activate().unwrap();
-                                }
-                                Err(err) => {
-                                    eprintln!("Exiting reader thread: {:?}", err);
-                                    break;
+                    std::thread::Builder::new()
+                        .name("network-reader".to_owned())
+                        .spawn(move || {
+                            let addr = std::env::var(ENV_HEAP_ANALYSIS_ADDR);
+                            let addr = addr.as_deref().unwrap_or("localhost:64123");
+                            let listener = TcpListener::bind(addr).unwrap();
+                            let stream = listener.incoming().next().unwrap().unwrap();
+                            let mut stream = BufReader::new(stream);
+                            loop {
+                                match bincode::options()
+                                    .with_fixint_encoding()
+                                    .deserialize_from::<_, TraceProtocol>(&mut stream)
+                                {
+                                    Ok(data) => {
+                                        sender.send(data).unwrap();
+                                        activator.activate().unwrap();
+                                    }
+                                    Err(err) => {
+                                        eprintln!("Exiting reader thread: {:?}", err);
+                                        break;
+                                    }
                                 }
                             }
-                        }
-                        std::mem::drop(sender);
-                        activator.activate().unwrap();
-                    });
+                            std::mem::drop(sender);
+                            activator.activate().unwrap();
+                        })
+                        .unwrap();
                     Some((cap, receiver))
                 } else {
                     None
                 };
 
+                let activator = scope.activator_for(&info.address[..]);
                 move |output| {
                     let mut exit = false;
                     if let Some((cap, receiver)) = state.as_mut() {
@@ -65,9 +69,13 @@ fn main() {
                             fuel -= 1;
                             match receiver.try_recv() {
                                 Ok(TraceProtocol::Instructions {
+                                    timestamp,
                                     thread_id,
                                     mut buffer,
                                 }) => {
+                                    if *cap.time() != timestamp {
+                                        cap.downgrade(&timestamp);
+                                    }
                                     let mut data = buffer
                                         .drain(..)
                                         .map(|(data, time)| (time, (thread_id, data)))
@@ -75,14 +83,22 @@ fn main() {
                                     output.session(&cap).give_vec(&mut data);
                                 }
                                 Ok(TraceProtocol::Init(_info)) => {}
+                                Ok(TraceProtocol::Stack {
+                                    index: _,
+                                    details: _,
+                                }) => {}
                                 Ok(TraceProtocol::Timestamp(timestamp)) => {
                                     cap.downgrade(&timestamp);
                                 }
-                                Err(TryRecvError::Disconnected) => exit = true,
-                                Err(TryRecvError::Empty) => {
-                                    fuel = 0;
+                                Err(TryRecvError::Disconnected) => {
+                                    exit = true;
+                                    break;
                                 }
+                                Err(TryRecvError::Empty) => break,
                             }
+                        }
+                        if fuel == 0 {
+                            activator.activate();
                         }
                     }
                     if exit {

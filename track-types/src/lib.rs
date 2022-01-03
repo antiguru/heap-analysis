@@ -35,6 +35,8 @@ impl From<usize> for TraceIndex {
 pub enum TraceProtocol {
     /// Provide a buffer of thread-local trace instructions.
     Instructions {
+        /// The current timestamp up to which all data has been shipped.
+        timestamp: Timestamp,
         /// The thread's ID
         thread_id: usize,
         /// Vector of timestamped instructions
@@ -44,6 +46,13 @@ pub enum TraceProtocol {
     Timestamp(Timestamp),
     /// Initialize instruction, only send once
     Init(InstrInit),
+    /// Resolved stack frames
+    Stack {
+        /// The index of the stack frame
+        index: usize,
+        /// Details of the stack frame, heap allocated to reduce struct size.
+        details: Box<InstrStackDetails>,
+    },
 }
 
 /// A choice of trace instructions
@@ -106,8 +115,8 @@ pub struct InstrInit {
 pub struct InstrStack {
     /// Instruction pointer on the stack.
     pub ip: u64,
-    /// Resolved symbol, heap-allocated to reduce the size of [TraceInstruction]
-    pub details: Option<Box<InstrStackDetails>>,
+    /// Index of this stack frame.
+    pub index: usize,
     /// Number of the parent stack frame
     pub parent: usize,
 }

@@ -1,8 +1,10 @@
 //! This module is loosely based on what Heaptrack uses to observe memory allocations
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ops::Deref;
+use std::rc::Rc;
 
 /// A representative for an instruction pointer in the back trace.
 #[derive(Debug)]
@@ -46,7 +48,11 @@ impl TraceTree {
     /// Obtain the index for the current instruction outside of the tracing logic
     ///
     /// Calls the callback for any newly encountered instruction pointer, or a new path.
-    pub fn index<C: FnMut(*const c_void, usize) -> bool>(
+    /// Its arguments are:
+    /// * The `ip` instruction pointer.
+    /// * The parent's stack frame's index.
+    /// * The index of this stack frame.
+    pub fn index<C: FnMut(*const c_void, usize, usize) -> bool>(
         &mut self,
         trace: &Trace,
         mut callback: C,
@@ -71,7 +77,7 @@ impl TraceTree {
                         ..Default::default()
                     };
                     parent.children.insert(position, edge);
-                    if !callback(*ip, parent.index) {
+                    if !callback(*ip, parent.index, index) {
                         return 0;
                     }
                     position
@@ -147,25 +153,24 @@ struct GlobalTraceEdge {
 /// TODO: Provide API to indicate thread termination
 #[derive(Debug)]
 pub struct GlobalTraceTree {
-    // (thread_id, local_trace_index) -> global_trace_index
-    local_to_global: HashMap<(usize, usize), usize>,
     // global_trace_index -> child of global_trace_index
     global_parent: Vec<GlobalTraceEdge>,
-    //
-    local_count: HashMap<usize, usize>,
+    // thread-local data
+    thread_data: HashMap<usize, Rc<RefCell<ThreadTreeData>>>,
 }
 
-impl Default for GlobalTraceTree {
-    fn default() -> Self {
-        Self {
-            local_to_global: Default::default(),
-            global_parent: vec![Default::default()],
-            local_count: Default::default(),
-        }
-    }
+#[derive(Debug)]
+struct ThreadTreeData {
+    local_to_global: Vec<usize>,
+    count: usize,
 }
 
-impl GlobalTraceTree {
+pub struct GlobalTraceTreeBorrow<'a> {
+    tree: &'a mut GlobalTraceTree,
+    thread_data: Rc<RefCell<ThreadTreeData>>,
+}
+
+impl<'a> GlobalTraceTreeBorrow<'a> {
     /// Push a new thread-local stack frame to the global tree
     ///
     /// The arguments are:
@@ -173,14 +178,14 @@ impl GlobalTraceTree {
     /// * `local_parent`: The thread-local parent stack frame
     /// * `ip`: The instruction pointer for the stack frame we're adding.
     ///
-    /// Returns `true` if the stack frame was not encountered before.
-    pub fn push(&mut self, thread_id: usize, local_parent: usize, ip: *const c_void) -> bool {
+    /// Returns a tuple of updated, global_parent, global_index:
+    /// * updated is `true` if the stack frame was not encountered before.
+    /// * The `global_parent` is the parent frame in the global context.
+    /// * The `global_index` is the index of this frame in the global context.
+    pub fn push(&mut self, local_parent: usize, ip: *const c_void) -> (bool, usize, usize) {
         // Determine the current local ID for the stack frame.
-        let local_id = {
-            let entry = self.local_count.entry(thread_id).or_default();
-            *entry += 1;
-            *entry
-        };
+        let mut thread_data = self.thread_data.borrow_mut();
+        thread_data.count += 1;
         // Determine the global ID of the local parent
         let global_parent = if local_parent == 0 {
             // 0 for the root
@@ -188,42 +193,64 @@ impl GlobalTraceTree {
         } else {
             // By induction, `local_to_global` already contains the desired information, anything
             // else is a bug.
-            *self
-                .local_to_global
-                .get(&(thread_id, local_parent))
-                .unwrap()
+            *thread_data.local_to_global.get(local_parent).unwrap()
         };
         // Determine the position of the child...
-        let (updated, index) = match self.global_parent[global_parent]
+        let (updated, index) = match self.tree.global_parent[global_parent]
             .children
-            .binary_search_by(|(this_ip, _)| this_ip.cmp(&ip))
+            .iter()
+            .find(|(this_ip, _)| this_ip == &ip)
         {
             // Found -> not updated, global index
-            Ok(position) => (
-                false,
-                self.global_parent[global_parent].children[position].1,
-            ),
+            Some((_ip, index)) => (false, *index),
             // Not found -> updates, insert new global index
-            Err(position) => {
-                let index = self.global_parent.len();
-                self.global_parent.push(Default::default());
-                self.global_parent[0].children.insert(position, (ip, index));
+            None => {
+                let index = self.tree.global_parent.len();
+                self.tree.global_parent.push(Default::default());
+                self.tree.global_parent[0].children.push((ip, index));
                 (true, index)
             }
         };
         // Remember the mapping for future lookups
-        self.local_to_global.insert((thread_id, local_id), index);
-        updated
+        thread_data.local_to_global.push(index);
+        (updated, global_parent, index)
     }
 
     /// Lookup a thread-local parent index and return its global index
     ///
-    /// The lookup must be preceeded with a number of `push` operations to populate the tree.
-    pub fn lookup(&mut self, thread_id: usize, local_parent: usize) -> usize {
-        let global_id = *self
-            .local_to_global
-            .get(&(thread_id, local_parent))
-            .unwrap_or(&0);
-        global_id
+    /// The lookup must be preceded with a number of `push` operations to populate the tree.
+    pub fn lookup(&self, local_parent: usize) -> usize {
+        self.thread_data.borrow().local_to_global[local_parent]
+    }
+}
+
+impl Default for ThreadTreeData {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            local_to_global: vec![0],
+        }
+    }
+}
+
+impl Default for GlobalTraceTree {
+    fn default() -> Self {
+        Self {
+            global_parent: vec![Default::default()],
+            thread_data: Default::default(),
+        }
+    }
+}
+
+impl GlobalTraceTree {
+    pub fn for_thread(&mut self, thread_id: usize) -> GlobalTraceTreeBorrow {
+        GlobalTraceTreeBorrow {
+            thread_data: self.thread_data.entry(thread_id).or_default().clone(),
+            tree: self,
+        }
+    }
+
+    pub fn remove_thread(&mut self, thread_id: usize) {
+        self.thread_data.remove(&thread_id);
     }
 }

@@ -12,10 +12,13 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{bounded, select, tick, Receiver, Sender, TryRecvError};
+use crossbeam_channel::{
+    bounded, select, tick, unbounded, Receiver, RecvError, SendError, Sender, TryRecvError,
+};
 
 use lazy_static::lazy_static;
 use libc::c_void;
+use retain_mut::RetainMut;
 
 use track_types::{
     InstrAllocation, InstrInit, InstrStack, InstrStackDetails, TimestampedTraceInstruction,
@@ -97,12 +100,15 @@ struct GatherHandle {
     /// Send endpoint to provide data
     sender: Option<Sender<GathererProtocol>>,
     /// shared join handle to wait for termination of the gatherer
-    handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    handle: Arc<Mutex<Option<[JoinHandle<()>; 2]>>>,
 }
 
 impl Default for GatherHandle {
     fn default() -> Self {
         let (sender, receiver) = bounded(64);
+
+        let (to_resolv_sender, to_resolv_receiver) = unbounded();
+        let (resolved_sender, resolved_receiver) = bounded(64);
 
         let handle = std::thread::Builder::new()
             .name("HA-gather".to_owned())
@@ -111,14 +117,25 @@ impl Default for GatherHandle {
                 AllocationWriter::WRITER.with(|x| *x.borrow_mut() = TrackingState::Disabled);
                 let addr = std::env::var(ENV_HEAP_ANALYSIS_ADDR);
                 let addr = addr.as_deref().unwrap_or("localhost:64123");
-                let mut gatherer = Gatherer::new(receiver, addr);
+                let mut gatherer =
+                    Gatherer::new(receiver, addr, to_resolv_sender, resolved_receiver);
                 gatherer.run();
+            })
+            .unwrap();
+
+        let resolv_handle = std::thread::Builder::new()
+            .name("HA-resolv".to_owned())
+            .spawn(|| {
+                // Disable tracking for this thread
+                AllocationWriter::WRITER.with(|x| *x.borrow_mut() = TrackingState::Disabled);
+                let resolver = Resolver::new(to_resolv_receiver, resolved_sender);
+                resolver.run();
             })
             .unwrap();
 
         Self {
             sender: Some(sender),
-            handle: Arc::new(Mutex::new(Some(handle))),
+            handle: Arc::new(Mutex::new(Some([handle, resolv_handle]))),
         }
     }
 }
@@ -174,11 +191,11 @@ impl Drop for GatherHandle {
             // try lock to avoid recusive locks on `GATHER`
             std::mem::drop(GATHER.try_lock().map(|mut guard| guard.take()));
             // Now, the gatherer thread can exit, and we wait for it
-            std::mem::drop(
+            std::mem::drop(handle.lock().map(|mut handle| {
                 handle
-                    .lock()
-                    .map(|mut handle| handle.take().map(|handle| handle.join())),
-            );
+                    .take()
+                    .map(|handle| handle.into_iter().for_each(|x| x.join().unwrap()))
+            }));
         }
     }
 }
@@ -191,20 +208,29 @@ struct Gatherer {
     receiver: Receiver<GathererProtocol>,
     /// Sink to write data
     connection: BufWriter<TcpStream>,
+    to_resolv_sender: Sender<ResolverProtocol>,
+    resolved_receiver: Receiver<(usize, InstrStackDetails)>,
     /// Translation table of thread-local stack frames to global stack frames
     trace_tree: GlobalTraceTree,
     /// Last time of timestamp announcement
     last_tick: Instant,
+    /// Current timestamp
+    timestamp: Duration,
 }
 
 impl Gatherer {
     /// Common bincode configuration
     fn bincode() -> impl bincode::Options {
-        bincode::options().with_varint_encoding()
+        bincode::options().with_fixint_encoding()
     }
 
     /// Construct a new gatherer from a receiver of thread updates
-    fn new<A: ToSocketAddrs>(receiver: Receiver<GathererProtocol>, addr: A) -> Self {
+    fn new<A: ToSocketAddrs>(
+        receiver: Receiver<GathererProtocol>,
+        addr: A,
+        to_resolv_sender: Sender<ResolverProtocol>,
+        resolved_receiver: Receiver<(usize, InstrStackDetails)>,
+    ) -> Self {
         let stream = TcpStream::connect(addr).unwrap();
         stream.set_nodelay(true).unwrap();
         let connection = BufWriter::new(stream);
@@ -212,8 +238,11 @@ impl Gatherer {
             buffers: Default::default(),
             receiver,
             connection,
+            to_resolv_sender,
+            resolved_receiver,
             trace_tree: Default::default(),
             last_tick: Instant::now(),
+            timestamp: Duration::from_secs(0),
         }
     }
 
@@ -223,7 +252,6 @@ impl Gatherer {
         loop {
             select! {
                 recv(tick) -> _tick => {
-                    println!("tick");
                     self.maybe_tick();
                 },
                 recv(self.receiver) -> msg => {
@@ -231,19 +259,44 @@ impl Gatherer {
                         Ok(protocol) => self.handle_protocol(protocol),
                         Err(_) => break,
                     }
-                    self.maybe_tick();
+                    // self.maybe_tick();
                 },
+                recv(self.resolved_receiver) -> msg => {
+                    match msg {
+                        Ok((index, details)) => self.handle_details(index, details),
+                        Err(_) => break,
+                    }
+                }
             }
         }
     }
 
+    fn shutdown(&mut self) {
+        self.handle_buffers();
+        self.to_resolv_sender
+            .send(ResolverProtocol::Shutdown)
+            .unwrap();
+        while let Ok((index, details)) = self.resolved_receiver.recv() {
+            self.handle_details(index, details)
+        }
+        self.connection.flush().unwrap();
+    }
+
     fn maybe_tick(&mut self) {
         if self.last_tick.elapsed() > Duration::from_millis(500) {
-            println!("maybe tick");
             self.last_tick = Instant::now();
             self.handle_buffers();
-            println!("took: {:?}", self.last_tick.elapsed());
         }
+    }
+
+    fn handle_details(&mut self, index: usize, details: InstrStackDetails) {
+        let details = details.into();
+        Self::bincode()
+            .serialize_into::<_, TraceProtocol>(
+                &mut self.connection,
+                &TraceProtocol::Stack { index, details },
+            )
+            .unwrap();
     }
 
     fn handle_protocol(&mut self, protocol: GathererProtocol) {
@@ -284,9 +337,9 @@ impl Gatherer {
         // Block new registrations from appearing.
         let _coordination_lock = REGISTRATION_LOCK.write();
         // Drain all pending data
-        let _ = self.drain_receiver().unwrap();
+        let _ = self.drain_receiver();
         // Capture current time as timestamp.
-        let time = START_TIME.elapsed().as_nanos() as u64;
+        self.timestamp = START_TIME.elapsed();
         let mut buffer = Vec::with_capacity(TraceBuffer::capacity());
         // Take the local buffers to allow calling &mut self functions.
         let mut states = self.buffers.take();
@@ -304,6 +357,7 @@ impl Gatherer {
             if dead {
                 // TODO: Announce thread termination
                 states.remove(index);
+                self.trace_tree.remove_thread(thread_id);
             } else {
                 index += 1;
             }
@@ -314,33 +368,11 @@ impl Gatherer {
         Self::bincode()
             .serialize_into::<_, TraceProtocol>(
                 &mut self.connection,
-                &TraceProtocol::Timestamp(time),
+                &TraceProtocol::Timestamp(self.timestamp.as_nanos() as u64),
             )
             .unwrap();
 
         self.connection.flush().unwrap();
-    }
-
-    /// Resolve an instruction pointer to a symbol.
-    fn resolve(&mut self, ip: *mut c_void) -> Box<InstrStackDetails> {
-        let mut details = InstrStackDetails::default();
-        unsafe {
-            backtrace::resolve_unsynchronized(ip as _, |sym| {
-                details.name = sym.name().map(|name| format!("{:#}", name));
-                details.filename = sym.filename().map(Into::into);
-                details.lineno = sym.lineno();
-                details.colno = sym.colno();
-            });
-        }
-        Box::new(details)
-    }
-
-    /// Fill details of allocation and translate to global trace index
-    fn fill_alloc(&mut self, thread_id: usize, alloc: &mut InstrAllocation) {
-        let global_id = self
-            .trace_tree
-            .lookup(thread_id, alloc.trace_index.0 as usize);
-        alloc.trace_index = global_id.into();
     }
 
     /// Send a buffer. Drains the contents from the buffer but leave allocation in place.
@@ -348,19 +380,28 @@ impl Gatherer {
         if buffer.is_empty() {
             return;
         }
-        for (instr, _time) in buffer.iter_mut() {
-            match instr {
-                TraceInstruction::Stack(stack) => {
-                    if self.trace_tree.push(thread_id, stack.parent, stack.ip as _) {
-                        stack.details = Some(self.resolve(stack.ip as _));
-                    }
+        let mut thread_tree = self.trace_tree.for_thread(thread_id);
+        buffer.retain_mut(|(instr, _time)| match instr {
+            TraceInstruction::Stack(stack) => {
+                let (updated, global_parent, global_index) =
+                    thread_tree.push(stack.parent, stack.ip as _);
+                if updated {
+                    self.to_resolv_sender
+                        .send(ResolverProtocol::Resolv(global_index, stack.ip))
+                        .unwrap();
+                    stack.index = global_index;
+                    stack.parent = global_parent;
                 }
-                TraceInstruction::Allocate(alloc) | TraceInstruction::Deallocate(alloc) => {
-                    self.fill_alloc(thread_id, alloc);
-                }
+                updated
             }
-        }
+            TraceInstruction::Allocate(alloc) | TraceInstruction::Deallocate(alloc) => {
+                let global_id = thread_tree.lookup(alloc.trace_index.0 as usize);
+                alloc.trace_index = global_id.into();
+                true
+            }
+        });
         let protocol = TraceProtocol::Instructions {
+            timestamp: self.timestamp.as_nanos() as u64,
             thread_id,
             buffer: std::mem::take(buffer),
         };
@@ -376,7 +417,59 @@ impl Gatherer {
 
 impl Drop for Gatherer {
     fn drop(&mut self) {
-        self.handle_buffers();
+        self.shutdown();
+    }
+}
+
+enum ResolverProtocol {
+    Resolv(usize, u64),
+    Shutdown,
+}
+
+struct Resolver {
+    receiver: Receiver<ResolverProtocol>,
+    sender: Sender<(usize, InstrStackDetails)>,
+}
+
+impl Resolver {
+    fn new(
+        receiver: Receiver<ResolverProtocol>,
+        sender: Sender<(usize, InstrStackDetails)>,
+    ) -> Self {
+        Self { receiver, sender }
+    }
+
+    /// Resolve an instruction pointer to a symbol.
+    fn resolve(&self, ip: *mut c_void) -> InstrStackDetails {
+        let mut details = InstrStackDetails::default();
+        unsafe {
+            backtrace::resolve_unsynchronized(ip as _, |sym| {
+                details.name = sym.name().map(|name| format!("{:#}", name));
+                details.filename = sym.filename().map(Into::into);
+                details.lineno = sym.lineno();
+                details.colno = sym.colno();
+            });
+        }
+        details
+    }
+
+    fn run(&self) {
+        loop {
+            match self.receiver.recv() {
+                Ok(ResolverProtocol::Resolv(index, ip)) => {
+                    let details = self.resolve(ip as *mut c_void);
+                    match self.sender.send((index, details)) {
+                        Ok(_) => {}
+                        Err(SendError(msg)) => {
+                            eprintln!("Failed to send: {:?}", msg);
+                            break;
+                        }
+                    }
+                }
+                Ok(ResolverProtocol::Shutdown) => break,
+                Err(RecvError) => break,
+            }
+        }
     }
 }
 
@@ -436,11 +529,11 @@ impl AllocationWriter {
     /// trace, i.e, current stack frame.
     fn alloc_index(&mut self, trace: &Trace) -> usize {
         let trace_buffer = &mut self.trace_buffer;
-        self.trace_tree.index(trace, |ip, parent| {
+        self.trace_tree.index(trace, |ip, parent, index| {
             trace_buffer.push(TraceInstruction::Stack(InstrStack {
                 ip: ip as _,
-                details: None,
                 parent,
+                index,
             }));
             true
         })
