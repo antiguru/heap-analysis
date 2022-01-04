@@ -1,11 +1,16 @@
 //! Types for representing heap allocations
 
-#![forbid(missing_docs)]
+// #![forbid(missing_docs)]
 
 use serde::{Deserialize, Serialize};
 
 /// Environment symbol for the heap analysis address.
 pub static ENV_HEAP_ANALYSIS_ADDR: &str = "HEAP_ANALYSIS_ADDR";
+
+pub mod track_types_capnp {
+    include!(concat!(env!("OUT_DIR"), "/track_types_capnp.rs"));
+}
+
 
 /// Nanosecond timestamp type, not relative to a specific moment in time. Can only be used to
 /// compare to each other.
