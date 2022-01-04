@@ -67,6 +67,22 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for TrackingAllocator<A> {
         AllocationWriter::writer(|writer| writer.handle_dealloc(ptr as _, layout.size(), 2));
         self.0.dealloc(ptr, layout)
     }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let new_ptr = self.0.realloc(ptr, layout, new_size);
+        if layout.size() != new_size || ptr != new_ptr {
+            AllocationWriter::writer(|writer| {
+                writer.handle_realloc(ptr as _, new_ptr as _, layout.size(), new_size, 2)
+            });
+        }
+        new_ptr
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let ptr = self.0.alloc_zeroed(layout);
+        AllocationWriter::writer(|writer| writer.handle_alloc(ptr as _, layout.size(), 2));
+        ptr
+    }
 }
 
 /// State of the allocation writer
@@ -560,6 +576,30 @@ impl AllocationWriter {
             size,
         };
         self.trace_buffer.push(TraceInstruction::Deallocate(free))
+    }
+
+    fn handle_realloc(
+        &mut self,
+        ptr: u64,
+        new_ptr: u64,
+        size: usize,
+        new_size: usize,
+        skip: usize,
+    ) {
+        let trace = Trace::new(skip);
+        let trace_index = self.alloc_index(&trace).into();
+        let free = InstrAllocation {
+            trace_index,
+            ptr,
+            size,
+        };
+        self.trace_buffer.push(TraceInstruction::Deallocate(free));
+        let allocate = InstrAllocation {
+            trace_index,
+            ptr: new_ptr,
+            size: new_size,
+        };
+        self.trace_buffer.push(TraceInstruction::Allocate(allocate));
     }
 }
 
