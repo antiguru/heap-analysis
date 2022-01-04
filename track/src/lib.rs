@@ -355,7 +355,7 @@ impl Gatherer {
         // Drain all pending data
         let _ = self.drain_receiver();
         // Capture current time as timestamp.
-        self.timestamp = START_TIME.elapsed();
+        let next_timestamp = START_TIME.elapsed();
         let mut buffer = Vec::with_capacity(TraceBuffer::capacity());
         // Take the local buffers to allow calling &mut self functions.
         let mut states = self.buffers.take();
@@ -381,6 +381,7 @@ impl Gatherer {
         let empty = self.buffers.replace(states);
         assert_eq!(empty.len(), 0);
         // Announce new timestamp
+        self.timestamp = next_timestamp;
         Self::bincode()
             .serialize_into::<_, TraceProtocol>(
                 &mut self.connection,
