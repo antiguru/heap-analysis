@@ -15,7 +15,9 @@ pub type Timestamp = u64;
 pub type TimestampedTraceInstruction = (TraceInstruction, Timestamp);
 
 /// Trace index type.
-#[derive(Debug, Default, Copy, Clone, Serialize, Deserialize, Ord, PartialOrd, Eq, PartialEq)]
+#[derive(
+    Debug, Default, Copy, Clone, Hash, Serialize, Deserialize, Ord, PartialOrd, Eq, PartialEq,
+)]
 pub struct TraceIndex(pub u32);
 
 impl From<u32> for TraceIndex {

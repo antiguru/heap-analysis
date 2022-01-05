@@ -1,25 +1,29 @@
 use bincode::Options;
+use std::collections::HashMap;
 use std::io::BufReader;
 use std::net::TcpListener;
+use std::time::Duration;
 
 use crossbeam_channel::{bounded, TryRecvError};
 use timely::dataflow::channels::pact::Pipeline;
 
 use timely::dataflow::operators::generic::source;
-use timely::dataflow::operators::{Map, Operator};
+use timely::dataflow::operators::{Inspect, Map, Operator};
 use timely::scheduling::Scheduler;
 
 use differential_dataflow::difference::DiffPair;
 use differential_dataflow::operators::arrange::Arrange;
-use differential_dataflow::operators::Count;
 use differential_dataflow::trace::implementations::ord::OrdValSpine;
 use differential_dataflow::trace::{BatchReader, Cursor};
 use differential_dataflow::AsCollection;
+use differential_dataflow::operators::Count;
 use timely::dataflow::scopes::Child;
 
-use track_types::{TraceInstruction, TraceProtocol, ENV_HEAP_ANALYSIS_ADDR};
+use track_types::{TraceIndex, TraceInstruction, TraceProtocol, ENV_HEAP_ANALYSIS_ADDR};
 
 fn main() {
+    const ROUND_TO: u64 = Duration::from_millis(500).as_nanos() as u64;
+
     timely::execute_from_args(std::env::args(), |worker| {
         worker.dataflow::<u64, _, _>(|scope| {
             let index = scope.index();
@@ -69,10 +73,10 @@ fn main() {
                             fuel -= 1;
                             match receiver.try_recv() {
                                 Ok(TraceProtocol::Instructions {
-                                    timestamp,
-                                    thread_id,
-                                    mut buffer,
-                                }) => {
+                                       timestamp,
+                                       thread_id,
+                                       mut buffer,
+                                   }) => {
                                     if *cap.time() != timestamp {
                                         cap.downgrade(&timestamp);
                                     }
@@ -84,9 +88,9 @@ fn main() {
                                 }
                                 Ok(TraceProtocol::Init(_info)) => {}
                                 Ok(TraceProtocol::Stack {
-                                    index: _,
-                                    details: _,
-                                }) => {}
+                                       index: _,
+                                       details: _,
+                                   }) => {}
                                 Ok(TraceProtocol::Timestamp(timestamp)) => {
                                     cap.downgrade(&timestamp);
                                 }
@@ -125,25 +129,32 @@ fn main() {
             let arranged = Arrange::<Child<_, u64>, _, (_, _, _), _>::arrange::<
                 OrdValSpine<_, _, _, _>,
             >(&collection);
-            let accum = arranged
+            let matched = arranged
                 .stream
-                .unary(Pipeline, "accumulatable", |_cap, _info| {
+                .unary_frontier(Pipeline, "accumulatable", |_cap, _info| {
+                    let mut stash: HashMap<u64, (u64, usize, TraceIndex)> = Default::default();
                     move |input, output| {
                         input.for_each(|time, data| {
                             let mut session = output.session(&time);
                             for wrapper in data.iter() {
                                 let batch = &wrapper;
                                 let mut cursor = batch.cursor();
-                                while let Some(_key) = cursor.get_key(batch) {
-                                    // println!("k: {:x}", key);
-                                    while let Some((_time, thread_id, _trace_index)) =
-                                        cursor.get_val(batch)
-                                    {
+                                while let Some(ptr) = cursor.get_key(batch) {
+                                    while let Some(current) = cursor.get_val(batch) {
                                         cursor.map_times(batch, |_time, diff| {
                                             if diff.element1 > 0 {
-                                                session.give((*thread_id, *time.time(), *diff));
+                                                let old = stash.insert(*ptr, *current);
+                                                if let Some(old) = old {
+                                                    println!("Duplicate allocation for 0x{:x}: old: {:?}, current: {:?}", ptr, old, current);
+                                                }
+                                            } else {
+                                                match stash.remove(ptr) {
+                                                    Some(alloc) =>
+                                                        session.give((*ptr, (alloc, *current, -diff.element2))),
+                                                    None =>
+                                                        println!("Deallocation with no allocation for 0x{:x}: {:?}", ptr, current),
+                                                }
                                             }
-                                            // println!("\tv: {:?}, t: {}, d: {:?}", val, time, diff,);
                                         });
                                         cursor.step_val(batch);
                                     }
@@ -151,18 +162,25 @@ fn main() {
                                 }
                             }
                         });
+                        if input.frontier.is_empty() {
+                            for (ptr, data) in stash.drain() {
+                                eprintln!("Leaked 0x{:x} {:?}", ptr, data);
+                            }
+                        }
                     }
-                })
-                .as_collection();
-            let accum_arranged =
-                Arrange::<Child<_, u64>, _, (), _>::arrange::<OrdValSpine<_, _, _, _>>(&accum);
-            accum_arranged.count().inspect(|(data, time, diff)| {
-                println!(
-                    "thread: {}, allocations: {:?}, sum size: {}, time: {:?}, diff: {}",
-                    data.0, data.1.element1, data.1.element2, time, diff,
-                );
-            });
+                });
+            matched
+                // .inspect(|(ptr, (alloc, dealloc, size))| {
+                //     println!(
+                //         "ptr: {:x}, {:?} -> {:?}, size: {}",
+                //         ptr, alloc, dealloc, size,
+                //     );
+                // });
+                .map(|(_ptr, (alloc, dealloc, size))| (((alloc.1, dealloc.1), ()), (dealloc.0 + ROUND_TO - 1)/ROUND_TO*ROUND_TO, size))
+                .as_collection()
+                .count()
+                .inspect(|((k, v), t, d)| println!("k: {:?} v: {} t: {}, d: {}", k, v, t, d));
         })
     })
-    .unwrap(); // asserts error-free execution
+        .unwrap(); // asserts error-free execution
 }
