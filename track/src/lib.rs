@@ -31,6 +31,17 @@ use crate::stacktrace::{GlobalTraceTree, Trace};
 mod stacktrace;
 
 /// Tracking memory allocator
+///
+/// # Example
+/// ```rust
+/// #[global_allocator]
+/// static ALLOC: heap_analysis_track::TrackingAllocator<std::alloc::System> = heap_analysis_track::TrackingAllocator(std::alloc::System);
+///
+/// fn main() {
+///     // Start the analysis service, then enable tracing:
+///     // ALLOC.start();
+/// }
+/// ```
 pub struct TrackingAllocator<A>(pub A);
 
 impl<A> TrackingAllocator<A> {
