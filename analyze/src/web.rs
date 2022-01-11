@@ -58,10 +58,7 @@ pub async fn register_handler(_body: RegisterRequest, clients: Clients) -> WebRe
 }
 
 async fn register_client(uuid: String, clients: Clients) {
-    clients
-        .write()
-        .await
-        .insert(uuid, Client { sender: None });
+    clients.write().await.insert(uuid, Client { sender: None });
 }
 
 pub async fn unregister_handler(id: String, clients: Clients) -> WebResult<impl Reply> {
@@ -84,7 +81,9 @@ pub async fn client_connection(ws: WebSocket, clients: Clients) {
         }
     }));
 
-    let client = Client { sender: Some(client_sender)};
+    let client = Client {
+        sender: Some(client_sender),
+    };
     clients.write().await.insert(id.clone(), client);
 
     println!("{} connected", id);
@@ -106,12 +105,4 @@ pub async fn client_connection(ws: WebSocket, clients: Clients) {
 
 async fn client_msg(id: &str, msg: Message) {
     println!("received message from {}: {:?}", id, msg);
-    let message = match msg.to_str() {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-
-    if message == "ping" || message == "ping\n" {
-        return;
-    }
 }

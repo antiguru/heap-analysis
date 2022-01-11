@@ -1,4 +1,4 @@
-use crate::{AllocError, OutputData};
+use crate::{AllocError, AllocPerThreadPair, OutputData};
 use bincode::Options;
 use core::default::Default;
 use core::hash::Hash;
@@ -26,11 +26,13 @@ use timely::dataflow::channels::pact::{Exchange, Pipeline};
 use timely::dataflow::operators::capture::event::Event;
 use timely::dataflow::operators::generic::builder_rc::OperatorBuilder;
 use timely::dataflow::operators::generic::operator::source;
-use timely::dataflow::operators::{Capture, Concatenate, Exchange as ExchangeOp, Inspect, Map, Operator};
+use timely::dataflow::operators::{Capture, Concatenate, Exchange as ExchangeOp, Map, Operator};
 use timely::dataflow::scopes::child::Child;
 use timely::scheduling::Scheduler;
 use timely::worker::Worker;
-use track_types::{TraceIndex, TraceInstruction, TraceProtocol, ENV_HEAP_ANALYSIS_ADDR, Timestamp};
+use track_types::{
+    StackInfo, Timestamp, TraceIndex, TraceInstruction, TraceProtocol, ENV_HEAP_ANALYSIS_ADDR,
+};
 
 fn fnv_hash<H: Hash>(value: &H) -> u64 {
     let mut hasher = fnv::FnvHasher::default();
@@ -129,11 +131,12 @@ fn construct_dataflow_inner(worker: &mut Worker<Generic>) -> Receiver<Event<u64,
                                     .collect();
                                 output.session(&cap).give_vec(&mut data);
                             }
-                            Ok(TraceProtocol::Init(_info)) => {}
-                            Ok(TraceProtocol::Stack {
+                            Ok(TraceProtocol::CreateThread(_info)) => {}
+                            Ok(TraceProtocol::DestroyThread(_info)) => {}
+                            Ok(TraceProtocol::Stack(StackInfo {
                                 index: _,
                                 details: _,
-                            }) => {}
+                            })) => {}
                             Ok(TraceProtocol::Timestamp(timestamp)) => {
                                 cap.downgrade(&timestamp);
                             }
@@ -232,10 +235,7 @@ fn construct_dataflow_inner(worker: &mut Worker<Generic>) -> Receiver<Event<u64,
                         if let Some(cap) = cap.take() {
                             let mut err_session = err_output_handle.session(&cap);
                             for (ptr, data) in stash.drain() {
-                                err_session.give(AllocError::DoubleFree {
-                                    ptr,
-                                    info: data,
-                                })
+                                err_session.give(AllocError::DoubleFree { ptr, info: data })
                             }
                         }
                     }
@@ -260,24 +260,40 @@ fn construct_dataflow_inner(worker: &mut Worker<Generic>) -> Receiver<Event<u64,
             .as_collection()
             .arrange_by_self()
             .as_collection(|k, _| k.0);
-        alloc_per_thread_pair.inspect(|(k, t, d)| println!("k: {:?}, t: {}, d: {}", k, t, d));
-        let alloc_per_thread_pair = alloc_per_thread_pair.inner.unary_notify(Exchange::new(|_| 0), "group_by_time", None, {
-            let mut stash: HashMap<Timestamp, Vec<(usize, usize, isize)>> = Default::default();
-            let mut buffer = Default::default();
-            move |input, output, not| {
-                while let Some((time, data)) = input.next() {
-                    data.swap(&mut buffer);
-                    stash.entry(*time.time()).or_default().extend(buffer.drain(..).map(|((t1, t2), _, size)| (t1, t2, size)));
-                    not.notify_at(time.retain());
-                }
-                not.for_each(|time, _cnt, _not| {
-                    if let Some(data) = stash.remove(time.time()) {
-                        output.session(&time).give(OutputData::AllocPerThreadPair(data));
+        // alloc_per_thread_pair.inspect(|(k, t, d)| println!("k: {:?}, t: {}, d: {}", k, t, d));
+        let alloc_per_thread_pair = alloc_per_thread_pair.inner.unary_notify(
+            Exchange::new(|_| 0),
+            "group_by_time",
+            None,
+            {
+                let mut stash: HashMap<Timestamp, Vec<_>> = Default::default();
+                let mut buffer = Default::default();
+                move |input, output, not| {
+                    while let Some((time, data)) = input.next() {
+                        data.swap(&mut buffer);
+                        stash
+                            .entry(*time.time())
+                            .or_default()
+                            .extend(buffer.drain(..).map(|((t1, t2), _, size)| {
+                                AllocPerThreadPair {
+                                    alloc_thread: t1,
+                                    dealloc_thread: t2,
+                                    size,
+                                }
+                            }));
+                        not.notify_at(time.retain());
                     }
-                })
-            }
-        });
-        err_stream.inspect(|err| println!("Err: {:?}", err));
+                    not.for_each(|time, _cnt, _not| {
+                        if let Some(data) = stash.remove(time.time()) {
+                            output
+                                .session(&time)
+                                .give(OutputData::AllocPerThreadPairs(data));
+                        }
+                    })
+                }
+            },
+        );
+        // err_stream.inspect(|err| println!("Err: {:?}", err));
         scope
             .concatenate([
                 err_stream.map(OutputData::AllocError),

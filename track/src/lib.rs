@@ -6,9 +6,9 @@ use bincode::Options;
 use std::alloc::{GlobalAlloc, Layout};
 use std::cell::{Cell, RefCell};
 use std::io::{BufWriter, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -21,8 +21,8 @@ use libc::c_void;
 use retain_mut::RetainMut;
 
 use track_types::{
-    InstrAllocation, InstrInit, InstrStack, InstrStackDetails, TimestampedTraceInstruction,
-    TraceInstruction, TraceProtocol, ENV_HEAP_ANALYSIS_ADDR,
+    CreateThread, DestroyThread, InstrAllocation, InstrStack, InstrStackDetails, StackInfo,
+    TimestampedTraceInstruction, TraceInstruction, TraceProtocol, ENV_HEAP_ANALYSIS_ADDR,
 };
 
 use crate::stacktrace::TraceTree;
@@ -47,35 +47,44 @@ pub struct TrackingAllocator<A>(pub A);
 impl<A> TrackingAllocator<A> {
     /// Enable tracking memory allocations. Should be the first call in `main`.
     pub fn start(&self) {
-        START_TRACKING.store(true, Ordering::SeqCst);
+        match GatherHandle::new() {
+            Ok(handle) => {
+                *GATHER.lock().unwrap() = Some(handle);
+                ENABLE_TRACKING.store(true, Ordering::SeqCst);
+            }
+            Err(err) => {
+                panic!("TrackingAllocator failed to start: {:?}", err);
+            }
+        }
     }
 }
 
 lazy_static! {
     /// Handle to the gatherer thread
-    static ref GATHER: Mutex<Option<GatherHandle>> = Mutex::new(Some(Default::default()));
+    static ref GATHER: Mutex<Option<GatherHandle>> = Mutex::new(None);
     /// Start time
     static ref START_TIME: std::time::Instant = std::time::Instant::now();
-    /// Coordination lock
-    static ref REGISTRATION_LOCK: RwLock<()> = Default::default();
 }
 
 /// Is tracking enabled?
-static START_TRACKING: AtomicBool = AtomicBool::new(false);
+static ENABLE_TRACKING: AtomicBool = AtomicBool::new(false);
 
 /// Monotonically-increasing thread counter to assign thread IDs
 static THREAD_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-/// TODO: Provide realloc, alloc_zeroed
 unsafe impl<A: GlobalAlloc> GlobalAlloc for TrackingAllocator<A> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = self.0.alloc(layout);
-        AllocationWriter::writer(|writer| writer.handle_alloc(ptr as _, layout.size(), 2));
+        if !ptr.is_null() {
+            AllocationWriter::writer(|writer| writer.handle_alloc(ptr as _, layout.size(), 2));
+        }
         ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        AllocationWriter::writer(|writer| writer.handle_dealloc(ptr as _, layout.size(), 2));
+        if !ptr.is_null() {
+            AllocationWriter::writer(|writer| writer.handle_dealloc(ptr as _, layout.size(), 2));
+        }
         self.0.dealloc(ptr, layout)
     }
 
@@ -106,17 +115,19 @@ enum TrackingState {
     Disabled,
 }
 
-/// Protocol definition for worker threads to send commands to the gatherer thread
+/// Flush a complete trace buffer
 #[derive(Debug)]
-enum GathererProtocol {
-    /// Flush a complete trace buffer
-    Flush(usize, Vec<TimestampedTraceInstruction>),
-    /// Register a shared handle to this thread's state
-    Register(
-        Arc<Mutex<ThreadState>>,
-        Arc<(Mutex<bool>, Condvar)>,
-        InstrInit,
-    ),
+struct FlushBuffer {
+    thread_id: usize,
+    buffer: Vec<TimestampedTraceInstruction>,
+}
+
+/// Register a shared handle to this thread's state
+#[derive(Debug)]
+struct Register {
+    thread_state: Arc<Mutex<ThreadState>>,
+    condvar: Arc<(Mutex<bool>, Condvar)>,
+    info: CreateThread,
 }
 
 /// Handle to the gatherer thread
@@ -125,30 +136,41 @@ enum GathererProtocol {
 #[derive(Clone, Debug)]
 struct GatherHandle {
     /// Send endpoint to provide data
-    sender: Option<Sender<GathererProtocol>>,
+    data_sender: Option<Sender<FlushBuffer>>,
+    /// Send endpoint to provide data
+    register_sender: Option<Sender<Register>>,
     /// shared join handle to wait for termination of the gatherer
     handle: Arc<Mutex<Option<[JoinHandle<()>; 2]>>>,
 }
 
-impl Default for GatherHandle {
-    fn default() -> Self {
-        let (sender, receiver) = bounded(64);
+impl GatherHandle {
+    fn new() -> Result<Self, std::io::Error> {
+        let (data_sender, data_receiver) = bounded(64);
+        let (registration_sender, registration_receiver) = unbounded();
 
         let (to_resolv_sender, to_resolv_receiver) = unbounded();
         let (resolved_sender, resolved_receiver) = bounded(64);
+
+        let addr = std::env::var(ENV_HEAP_ANALYSIS_ADDR);
+        let addr = addr.as_deref().unwrap_or("localhost:64123");
+        let stream = TcpStream::connect(addr)?;
+        stream.set_nodelay(true)?;
+        let connection = BufWriter::new(stream);
 
         let handle = std::thread::Builder::new()
             .name("HA-gather".to_owned())
             .spawn(|| {
                 // Disable tracking for this thread
                 AllocationWriter::WRITER.with(|x| *x.borrow_mut() = TrackingState::Disabled);
-                let addr = std::env::var(ENV_HEAP_ANALYSIS_ADDR);
-                let addr = addr.as_deref().unwrap_or("localhost:64123");
-                let mut gatherer =
-                    Gatherer::new(receiver, addr, to_resolv_sender, resolved_receiver);
+                let mut gatherer = Gatherer::new(
+                    data_receiver,
+                    registration_receiver,
+                    connection,
+                    to_resolv_sender,
+                    resolved_receiver,
+                );
                 gatherer.run();
-            })
-            .unwrap();
+            })?;
 
         let resolv_handle = std::thread::Builder::new()
             .name("HA-resolv".to_owned())
@@ -157,35 +179,29 @@ impl Default for GatherHandle {
                 AllocationWriter::WRITER.with(|x| *x.borrow_mut() = TrackingState::Disabled);
                 let resolver = Resolver::new(to_resolv_receiver, resolved_sender);
                 resolver.run();
-            })
-            .unwrap();
+            })?;
 
-        Self {
-            sender: Some(sender),
+        Ok(Self {
+            data_sender: Some(data_sender),
+            register_sender: Some(registration_sender),
             handle: Arc::new(Mutex::new(Some([handle, resolv_handle]))),
-        }
+        })
     }
 }
 
 impl GatherHandle {
     /// Register a thread state with the gatherer
-    fn register<T>(
-        &self,
-        thread_state: Arc<Mutex<ThreadState>>,
-        info: InstrInit,
-        registration_lock: T,
-    ) {
+    fn register(&self, thread_state: Arc<Mutex<ThreadState>>, info: CreateThread) {
         let condvar = Arc::new((Mutex::new(false), Condvar::new()));
-        std::mem::drop(registration_lock);
 
-        self.sender
+        self.register_sender
             .as_ref()
             .expect("Sender exists until drop")
-            .send(GathererProtocol::Register(
+            .send(Register {
                 thread_state,
-                Arc::clone(&condvar),
+                condvar: Arc::clone(&condvar),
                 info,
-            ))
+            })
             .unwrap();
 
         // Wait for the gather thread to accept our registration, only then we're allowed to allocate memory
@@ -198,10 +214,10 @@ impl GatherHandle {
 
     /// Send a complete buffer to the gatherer
     fn flush(&self, thread_id: usize, buffer: Vec<TimestampedTraceInstruction>) {
-        self.sender
+        self.data_sender
             .as_ref()
             .expect("Sender exists until drop")
-            .send(GathererProtocol::Flush(thread_id, buffer))
+            .send(FlushBuffer { thread_id, buffer })
             .unwrap();
     }
 }
@@ -210,7 +226,11 @@ impl Drop for GatherHandle {
     fn drop(&mut self) {
         // The drop implementation is responsible for terminating the gatherer once it's the last
         // handle to it.
-        self.sender.take();
+
+        // Drop channels
+        self.data_sender.take();
+        self.register_sender.take();
+
         // strong count == 2 -> static reference + main thread, so we're the last thread to exit
         if Arc::strong_count(&self.handle) == 2 {
             // Take ownership of the join handle
@@ -232,10 +252,14 @@ struct Gatherer {
     /// Shared handle to the thread states.
     buffers: Cell<Vec<Arc<Mutex<ThreadState>>>>,
     /// Receive endpoint to get push updates from threads.
-    receiver: Receiver<GathererProtocol>,
+    data_receiver: Receiver<FlushBuffer>,
+    /// Receive endpoint for registering new threads.
+    registration_receiver: Receiver<Register>,
     /// Sink to write data
     connection: BufWriter<TcpStream>,
+    /// Sender to resolv thread.
     to_resolv_sender: Sender<ResolverProtocol>,
+    /// Receiver from resolv thread.
     resolved_receiver: Receiver<(usize, InstrStackDetails)>,
     /// Translation table of thread-local stack frames to global stack frames
     trace_tree: GlobalTraceTree,
@@ -252,21 +276,20 @@ impl Gatherer {
     }
 
     /// Construct a new gatherer from a receiver of thread updates
-    fn new<A: ToSocketAddrs>(
-        receiver: Receiver<GathererProtocol>,
-        addr: A,
+    fn new(
+        data_receiver: Receiver<FlushBuffer>,
+        registration_receiver: Receiver<Register>,
+        connection: BufWriter<TcpStream>,
         to_resolv_sender: Sender<ResolverProtocol>,
         resolved_receiver: Receiver<(usize, InstrStackDetails)>,
     ) -> Self {
-        let stream = TcpStream::connect(addr).unwrap();
-        stream.set_nodelay(true).unwrap();
-        let connection = BufWriter::new(stream);
         Self {
-            buffers: Default::default(),
-            receiver,
+            data_receiver,
+            registration_receiver,
             connection,
             to_resolv_sender,
             resolved_receiver,
+            buffers: Default::default(),
             trace_tree: Default::default(),
             last_tick: Instant::now(),
             timestamp: Duration::from_secs(0),
@@ -281,12 +304,17 @@ impl Gatherer {
                 recv(tick) -> _tick => {
                     self.maybe_tick();
                 },
-                recv(self.receiver) -> msg => {
+                recv(self.data_receiver) -> msg => {
                     match msg {
-                        Ok(protocol) => self.handle_protocol(protocol),
+                        Ok(FlushBuffer{thread_id, buffer}) => self.handle_flush(thread_id, buffer),
                         Err(_) => break,
                     }
-                    // self.maybe_tick();
+                },
+                recv(self.registration_receiver) -> msg => {
+                    match msg {
+                        Ok(register) => self.handle_register(register),
+                        Err(_) => break,
+                    }
                 },
                 recv(self.resolved_receiver) -> msg => {
                     match msg {
@@ -321,37 +349,39 @@ impl Gatherer {
         Self::bincode()
             .serialize_into::<_, TraceProtocol>(
                 &mut self.connection,
-                &TraceProtocol::Stack { index, details },
+                &TraceProtocol::Stack(StackInfo { index, details }),
             )
             .unwrap();
     }
 
-    fn handle_protocol(&mut self, protocol: GathererProtocol) {
-        match protocol {
-            GathererProtocol::Register(shared_buffer, condvar, info) => {
-                self.buffers.get_mut().push(shared_buffer);
-                let (lock, signal) = &*condvar;
-                let mut started = lock.lock().unwrap();
-                *started = true;
-                signal.notify_one();
-                Self::bincode()
-                    .serialize_into::<_, TraceProtocol>(
-                        &mut self.connection,
-                        &TraceProtocol::Init(info),
-                    )
-                    .unwrap();
-            }
-            GathererProtocol::Flush(thread_id, mut buffer) => {
-                self.send_buffer(thread_id, &mut buffer);
-            }
-        }
+    fn handle_register(
+        &mut self,
+        Register {
+            thread_state,
+            condvar,
+            info,
+        }: Register,
+    ) {
+        self.buffers.get_mut().push(thread_state);
+        let (lock, signal) = &*condvar;
+        let mut started = lock.lock().unwrap();
+        *started = true;
+        signal.notify_one();
+        let init = TraceProtocol::CreateThread(info);
+        Self::bincode()
+            .serialize_into(&mut self.connection, &init)
+            .unwrap();
+    }
+
+    fn handle_flush(&mut self, thread_id: usize, mut buffer: Vec<TimestampedTraceInstruction>) {
+        self.send_buffer(thread_id, &mut buffer);
         self.connection.flush().unwrap();
     }
 
     fn drain_receiver(&mut self) -> Result<(), crossbeam_channel::TryRecvError> {
         loop {
-            match self.receiver.try_recv() {
-                Ok(protocol) => self.handle_protocol(protocol),
+            match self.data_receiver.try_recv() {
+                Ok(FlushBuffer { thread_id, buffer }) => self.handle_flush(thread_id, buffer),
                 Err(TryRecvError::Disconnected) => return Err(TryRecvError::Disconnected),
                 Err(TryRecvError::Empty) => break,
             }
@@ -361,8 +391,6 @@ impl Gatherer {
 
     /// Forcibly flush buffers from worker threads
     fn handle_buffers(&mut self) {
-        // Block new registrations from appearing.
-        let _coordination_lock = REGISTRATION_LOCK.write();
         // Drain all pending data
         let _ = self.drain_receiver();
         // Capture current time as timestamp.
@@ -382,9 +410,15 @@ impl Gatherer {
             self.send_buffer(thread_id, &mut buffer);
             // Remove dead threads
             if dead {
-                // TODO: Announce thread termination
+                // Remove shared thread-local state
                 states.remove(index);
+                // Remove this thread's trace tree translation
                 self.trace_tree.remove_thread(thread_id);
+                // Announce thread termination
+                let destroy_thread = TraceProtocol::DestroyThread(DestroyThread { thread_id });
+                Self::bincode()
+                    .serialize_into(&mut self.connection, &destroy_thread)
+                    .unwrap();
             } else {
                 index += 1;
             }
@@ -521,7 +555,7 @@ impl AllocationWriter {
     /// reentrant calls.
     #[inline(always)]
     fn writer<F: FnOnce(&mut AllocationWriter)>(f: F) {
-        if !START_TRACKING.load(Ordering::SeqCst) {
+        if !ENABLE_TRACKING.load(Ordering::SeqCst) {
             return;
         }
         // `try_with` to prevent tracking allocations once the TLS is in a destructed state.
@@ -568,23 +602,23 @@ impl AllocationWriter {
     }
 
     /// Handle a memory allocation
-    fn handle_alloc(&mut self, ptr: u64, size: usize, skip: usize) {
+    fn handle_alloc(&mut self, ptr: *mut u8, size: usize, skip: usize) {
         let trace = Trace::new(skip);
         let trace_index = self.alloc_index(&trace).into();
         let allocate = InstrAllocation {
             trace_index,
-            ptr,
+            ptr: ptr as u64,
             size,
         };
         self.trace_buffer.push(TraceInstruction::Allocate(allocate))
     }
 
-    fn handle_dealloc(&mut self, ptr: u64, size: usize, skip: usize) {
+    fn handle_dealloc(&mut self, ptr: *mut u8, size: usize, skip: usize) {
         let trace = Trace::new(skip);
         let trace_index = self.alloc_index(&trace).into();
         let free = InstrAllocation {
             trace_index,
-            ptr,
+            ptr: ptr as u64,
             size,
         };
         self.trace_buffer.push(TraceInstruction::Deallocate(free))
@@ -592,8 +626,8 @@ impl AllocationWriter {
 
     fn handle_realloc(
         &mut self,
-        ptr: u64,
-        new_ptr: u64,
+        ptr: *mut u8,
+        new_ptr: *mut u8,
         size: usize,
         new_size: usize,
         skip: usize,
@@ -602,13 +636,13 @@ impl AllocationWriter {
         let trace_index = self.alloc_index(&trace).into();
         let free = InstrAllocation {
             trace_index,
-            ptr,
+            ptr: ptr as u64,
             size,
         };
         self.trace_buffer.push(TraceInstruction::Deallocate(free));
         let allocate = InstrAllocation {
             trace_index,
-            ptr: new_ptr,
+            ptr: new_ptr as u64,
             size: new_size,
         };
         self.trace_buffer.push(TraceInstruction::Allocate(allocate));
@@ -656,13 +690,11 @@ impl TraceBuffer {
     }
 
     fn init(&mut self) {
-        let registration_lock = REGISTRATION_LOCK.read().unwrap();
-        let info = InstrInit {
+        let info = CreateThread {
             thread_name: format!("{:?}", std::thread::current().id().to_owned()),
             thread_id: self.buffer.lock().unwrap().thread_id,
         };
-        self.handle
-            .register(self.buffer.clone(), info, registration_lock);
+        self.handle.register(self.buffer.clone(), info);
     }
 
     fn push(&mut self, instruction: TraceInstruction) {

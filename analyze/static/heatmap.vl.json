@@ -1,0 +1,13 @@
+{
+  "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+  "data": {"name": "table"},
+  "mark": "rect",
+  "encoding": {
+    "y": {"field": "alloc_thread", "type": "nominal"},
+    "x": {"field": "dealloc_thread", "type": "ordinal"},
+    "color": {"aggregate": "median", "field": "size"}
+  },
+  "config": {
+    "axis": {"grid": true, "tickBand": "extent"}
+  }
+}

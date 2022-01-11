@@ -46,15 +46,22 @@ pub enum TraceProtocol {
     },
     /// Update the time. All data up to this point has been shipped.
     Timestamp(Timestamp),
-    /// Initialize instruction, only send once
-    Init(InstrInit),
+    /// Announce a new thread
+    CreateThread(CreateThread),
+    /// Notify thread termination
+    DestroyThread(DestroyThread),
     /// Resolved stack frames
-    Stack {
-        /// The index of the stack frame
-        index: usize,
-        /// Details of the stack frame, heap allocated to reduce struct size.
-        details: Box<InstrStackDetails>,
-    },
+    // TOOD: Change to Vec<StackInfo>.
+    Stack(StackInfo),
+}
+
+/// Resolved stack frame
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StackInfo {
+    /// The index of the stack frame
+    pub index: usize,
+    /// Details of the stack frame, heap allocated to reduce struct size.
+    pub details: Box<InstrStackDetails>,
 }
 
 /// A choice of trace instructions
@@ -100,11 +107,18 @@ impl TraceInstruction {
     }
 }
 
-/// Initialization instruction
+/// Announce a new thread
 #[derive(Debug, Clone, Serialize, Deserialize, Ord, PartialOrd, Eq, PartialEq)]
-pub struct InstrInit {
+pub struct CreateThread {
     /// Human-readable name of the thread
     pub thread_name: String,
+    /// Opaque thread id, unique per thread
+    pub thread_id: usize,
+}
+
+/// Announce thread termination
+#[derive(Debug, Clone, Serialize, Deserialize, Ord, PartialOrd, Eq, PartialEq)]
+pub struct DestroyThread {
     /// Opaque thread id, unique per thread
     pub thread_id: usize,
 }

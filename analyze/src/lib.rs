@@ -20,11 +20,18 @@ pub enum AllocError {
     Leak {
         ptr: u64,
         info: AllocInfo,
-    }
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum OutputData {
     AllocError(AllocError),
-    AllocPerThreadPair(Vec<(usize, usize, isize)>),
+    AllocPerThreadPairs(Vec<AllocPerThreadPair>),
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct AllocPerThreadPair {
+    pub alloc_thread: usize,
+    pub dealloc_thread: usize,
+    pub size: isize,
 }

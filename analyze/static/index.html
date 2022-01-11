@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<head>
+    <meta charset="utf-8">
+    <script src="https://cdn.jsdelivr.net/npm/vega@5.21.0/build/vega.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/vega-lite@5.2.0/build/vega-lite.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/vega-embed@6.20.2/build/vega-embed.js"></script>
+
+<!--    <script src="https://cdn.jsdelivr.net/npm/vega@5"></script>-->
+<!--    <script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script>-->
+<!--    <script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script>-->
+</head>
+
+<body>
+<div id="vis"></div>
+
+<script>
+    const spec = "heatmap.vl.json";
+    vegaEmbed('#vis', spec, {defaultStyle: true})
+      .then(function(result) {
+        const view = result.view;
+
+        // connect to simple echo server
+        const conn = new WebSocket("ws://localhost:8088/ws");
+
+        conn.onopen = function(event) {
+          // insert data as it arrives from the socket
+          conn.onmessage = function(event) {
+            var data = JSON.parse(event.data);
+            console.log(data);
+            // Use the Vega view api to insert data
+            data.forEach(datum => {
+              if (datum.hasOwnProperty("AllocPerThreadPairs")) {
+                console.log(datum["AllocPerThreadPairs"]);
+                view.insert("table", datum["AllocPerThreadPairs"]).run();
+              }
+            });
+          }
+        }
+      })
+      .catch(console.warn);
+  </script>
+</body>
