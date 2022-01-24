@@ -33,5 +33,6 @@ pub enum OutputData {
 pub struct AllocPerThreadPair {
     pub alloc_thread: usize,
     pub dealloc_thread: usize,
+    pub count: isize,
     pub size: isize,
 }

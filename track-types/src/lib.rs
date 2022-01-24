@@ -52,7 +52,7 @@ pub enum TraceProtocol {
     DestroyThread(DestroyThread),
     /// Resolved stack frames
     // TOOD: Change to Vec<StackInfo>.
-    Stack(StackInfo),
+    Stack(Timestamp, Vec<(Timestamp, StackInfo)>),
 }
 
 /// Resolved stack frame
@@ -61,7 +61,7 @@ pub struct StackInfo {
     /// The index of the stack frame
     pub index: usize,
     /// Details of the stack frame, heap allocated to reduce struct size.
-    pub details: Box<InstrStackDetails>,
+    pub details: InstrStackDetails,
 }
 
 /// A choice of trace instructions

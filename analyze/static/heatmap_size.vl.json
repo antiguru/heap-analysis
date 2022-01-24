@@ -1,12 +1,13 @@
 {
   "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
   "data": {"name": "table"},
-  "layer": [
+  "width": "container",
+  "height": "container",
+  "columns": 2,
+  "concat": [
     {
-      "mark": {
-        "type": "rect",
-        "tooltip": true
-      },
+      "mark": "rect",
+      "width": "container",
       "encoding": {
         "y": {
           "field": "alloc_thread",
@@ -14,20 +15,16 @@
         },
         "x": {
           "field": "dealloc_thread",
-          "type": "nominal"
+          "type": "ordinal"
         },
         "color": {
           "aggregate": "median",
-          "field": "count"
+          "field": "size"
         }
       }
     },
     {
-      "mark": {
-        "type": "point",
-        "tooltip": true,
-        "color": "orange"
-      },
+      "mark": "rect",
       "encoding": {
         "y": {
           "field": "alloc_thread",
@@ -35,11 +32,11 @@
         },
         "x": {
           "field": "dealloc_thread",
-          "type": "nominal"
+          "type": "ordinal"
         },
-        "size": {
+        "color": {
           "aggregate": "median",
-          "field": "size"
+          "field": "count"
         }
       }
     }

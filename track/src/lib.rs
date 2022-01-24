@@ -22,7 +22,8 @@ use retain_mut::RetainMut;
 
 use track_types::{
     CreateThread, DestroyThread, InstrAllocation, InstrStack, InstrStackDetails, StackInfo,
-    TimestampedTraceInstruction, TraceInstruction, TraceProtocol, ENV_HEAP_ANALYSIS_ADDR,
+    Timestamp, TimestampedTraceInstruction, TraceInstruction, TraceProtocol,
+    ENV_HEAP_ANALYSIS_ADDR,
 };
 
 use crate::stacktrace::TraceTree;
@@ -260,13 +261,15 @@ struct Gatherer {
     /// Sender to resolv thread.
     to_resolv_sender: Sender<ResolverProtocol>,
     /// Receiver from resolv thread.
-    resolved_receiver: Receiver<(usize, InstrStackDetails)>,
+    resolved_receiver: Receiver<(Timestamp, StackInfo)>,
     /// Translation table of thread-local stack frames to global stack frames
     trace_tree: GlobalTraceTree,
     /// Last time of timestamp announcement
     last_tick: Instant,
     /// Current timestamp
     timestamp: Duration,
+    /// Buffer for stack details
+    stack_details_buffer: Vec<(Timestamp, StackInfo)>,
 }
 
 impl Gatherer {
@@ -281,7 +284,7 @@ impl Gatherer {
         registration_receiver: Receiver<Register>,
         connection: BufWriter<TcpStream>,
         to_resolv_sender: Sender<ResolverProtocol>,
-        resolved_receiver: Receiver<(usize, InstrStackDetails)>,
+        resolved_receiver: Receiver<(Timestamp, StackInfo)>,
     ) -> Self {
         Self {
             data_receiver,
@@ -290,6 +293,7 @@ impl Gatherer {
             to_resolv_sender,
             resolved_receiver,
             buffers: Default::default(),
+            stack_details_buffer: Default::default(),
             trace_tree: Default::default(),
             last_tick: Instant::now(),
             timestamp: Duration::from_secs(0),
@@ -318,7 +322,7 @@ impl Gatherer {
                 },
                 recv(self.resolved_receiver) -> msg => {
                     match msg {
-                        Ok((index, details)) => self.handle_details(index, details),
+                        Ok((timestamp, details)) => self.handle_details(timestamp, details),
                         Err(_) => break,
                     }
                 }
@@ -331,8 +335,8 @@ impl Gatherer {
         self.to_resolv_sender
             .send(ResolverProtocol::Shutdown)
             .unwrap();
-        while let Ok((index, details)) = self.resolved_receiver.recv() {
-            self.handle_details(index, details)
+        while let Ok((timestamp, details)) = self.resolved_receiver.recv() {
+            self.handle_details(timestamp, details)
         }
         self.connection.flush().unwrap();
     }
@@ -344,14 +348,21 @@ impl Gatherer {
         }
     }
 
-    fn handle_details(&mut self, index: usize, details: InstrStackDetails) {
-        let details = details.into();
-        Self::bincode()
-            .serialize_into::<_, TraceProtocol>(
-                &mut self.connection,
-                &TraceProtocol::Stack(StackInfo { index, details }),
-            )
-            .unwrap();
+    fn handle_details(&mut self, timestamp: Timestamp, info: StackInfo) {
+        if self.stack_details_buffer.capacity() < 1024 {
+            let to_reserve = 1024 - self.stack_details_buffer.capacity();
+            self.stack_details_buffer.reserve(to_reserve);
+        }
+        self.stack_details_buffer.push((timestamp, info));
+        if self.stack_details_buffer.len() == self.stack_details_buffer.capacity() {
+            let buffer = std::mem::take(&mut self.stack_details_buffer);
+            Self::bincode()
+                .serialize_into::<_, TraceProtocol>(
+                    &mut self.connection,
+                    &TraceProtocol::Stack(buffer[0].0, buffer),
+                )
+                .unwrap();
+        }
     }
 
     fn handle_register(
@@ -443,13 +454,17 @@ impl Gatherer {
             return;
         }
         let mut thread_tree = self.trace_tree.for_thread(thread_id);
-        buffer.retain_mut(|(instr, _time)| match instr {
+        buffer.retain_mut(|(instr, time)| match instr {
             TraceInstruction::Stack(stack) => {
                 let (updated, global_parent, global_index) =
                     thread_tree.push(stack.parent, stack.ip as _);
                 if updated {
                     self.to_resolv_sender
-                        .send(ResolverProtocol::Resolv(global_index, stack.ip))
+                        .send(ResolverProtocol::Resolv {
+                            timestamp: *time,
+                            index: global_index,
+                            ip: stack.ip,
+                        })
                         .unwrap();
                     stack.index = global_index;
                     stack.parent = global_parent;
@@ -484,20 +499,21 @@ impl Drop for Gatherer {
 }
 
 enum ResolverProtocol {
-    Resolv(usize, u64),
+    Resolv {
+        timestamp: Timestamp,
+        index: usize,
+        ip: u64,
+    },
     Shutdown,
 }
 
 struct Resolver {
     receiver: Receiver<ResolverProtocol>,
-    sender: Sender<(usize, InstrStackDetails)>,
+    sender: Sender<(Timestamp, StackInfo)>,
 }
 
 impl Resolver {
-    fn new(
-        receiver: Receiver<ResolverProtocol>,
-        sender: Sender<(usize, InstrStackDetails)>,
-    ) -> Self {
+    fn new(receiver: Receiver<ResolverProtocol>, sender: Sender<(Timestamp, StackInfo)>) -> Self {
         Self { receiver, sender }
     }
 
@@ -518,9 +534,13 @@ impl Resolver {
     fn run(&self) {
         loop {
             match self.receiver.recv() {
-                Ok(ResolverProtocol::Resolv(index, ip)) => {
+                Ok(ResolverProtocol::Resolv {
+                    timestamp,
+                    index,
+                    ip,
+                }) => {
                     let details = self.resolve(ip as *mut c_void);
-                    match self.sender.send((index, details)) {
+                    match self.sender.send((timestamp, StackInfo { index, details })) {
                         Ok(_) => {}
                         Err(SendError(msg)) => {
                             eprintln!("Failed to send: {:?}", msg);

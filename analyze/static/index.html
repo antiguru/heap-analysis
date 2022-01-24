@@ -31,7 +31,11 @@
             data.forEach(datum => {
               if (datum.hasOwnProperty("AllocPerThreadPairs")) {
                 console.log(datum["AllocPerThreadPairs"]);
-                view.insert("table", datum["AllocPerThreadPairs"]).run();
+                var changeSet = vega
+                  .changeset()
+                  .remove(function (t) {return true})
+                  .insert(datum["AllocPerThreadPairs"]);
+                view.change("table", changeSet).run();
               }
             });
           }

@@ -30,9 +30,7 @@ use timely::dataflow::operators::{Capture, Concatenate, Exchange as ExchangeOp, 
 use timely::dataflow::scopes::child::Child;
 use timely::scheduling::Scheduler;
 use timely::worker::Worker;
-use track_types::{
-    StackInfo, Timestamp, TraceIndex, TraceInstruction, TraceProtocol, ENV_HEAP_ANALYSIS_ADDR,
-};
+use track_types::{Timestamp, TraceIndex, TraceInstruction, TraceProtocol, ENV_HEAP_ANALYSIS_ADDR};
 
 fn fnv_hash<H: Hash>(value: &H) -> u64 {
     let mut hasher = fnv::FnvHasher::default();
@@ -133,10 +131,7 @@ fn construct_dataflow_inner(worker: &mut Worker<Generic>) -> Receiver<Event<u64,
                             }
                             Ok(TraceProtocol::CreateThread(_info)) => {}
                             Ok(TraceProtocol::DestroyThread(_info)) => {}
-                            Ok(TraceProtocol::Stack(StackInfo {
-                                index: _,
-                                details: _,
-                            })) => {}
+                            Ok(TraceProtocol::Stack(_timestamp, _infos)) => {}
                             Ok(TraceProtocol::Timestamp(timestamp)) => {
                                 cap.downgrade(&timestamp);
                             }
@@ -214,10 +209,8 @@ fn construct_dataflow_inner(worker: &mut Worker<Generic>) -> Receiver<Event<u64,
                                             }
                                         } else {
                                             match stash.remove(ptr) {
-                                                Some(alloc) => session.give((
-                                                    *ptr,
-                                                    (alloc, *current, -diff.element2),
-                                                )),
+                                                Some(alloc) => session
+                                                    .give((*ptr, (alloc, *current, *diff * -1))),
                                                 None => err_session.give(AllocError::DoubleFree {
                                                     ptr: *ptr,
                                                     info: *current,
@@ -250,11 +243,11 @@ fn construct_dataflow_inner(worker: &mut Worker<Generic>) -> Receiver<Event<u64,
             //         ptr, alloc, dealloc, size,
             //     );
             // });
-            .map(|(_ptr, (alloc, dealloc, size))| {
+            .map(|(_ptr, (alloc, dealloc, count_size))| {
                 (
                     ((alloc.1, dealloc.1), ()),
                     (dealloc.0 + ROUND_TO - 1) / ROUND_TO * ROUND_TO,
-                    size,
+                    count_size,
                 )
             })
             .as_collection()
@@ -274,11 +267,12 @@ fn construct_dataflow_inner(worker: &mut Worker<Generic>) -> Receiver<Event<u64,
                         stash
                             .entry(*time.time())
                             .or_default()
-                            .extend(buffer.drain(..).map(|((t1, t2), _, size)| {
+                            .extend(buffer.drain(..).map(|((t1, t2), _, count_size)| {
                                 AllocPerThreadPair {
                                     alloc_thread: t1,
                                     dealloc_thread: t2,
-                                    size,
+                                    count: count_size.element1,
+                                    size: count_size.element2,
                                 }
                             }));
                         not.notify_at(time.retain());
