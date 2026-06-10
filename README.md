@@ -10,7 +10,7 @@ this crate and declare it as the global allocator like this:
 ```rust
 /// Global allocator wrapping other allocator.
 #[global_allocator]
-static ALLOC: heaptrack_rust_track::TrackingAllocator<std::alloc::System> = TrackingAllocator(std::alloc::System);
+static ALLOC: heap_analysis_track::TrackingAllocator<std::alloc::System> = heap_analysis_track::TrackingAllocator(std::alloc::System);
 
 fn main() {
     ALLOC.start();
@@ -35,6 +35,9 @@ symbol `HEAP_ANALYSIS_ADDR`.
 
 ## Limitations
 
-* Thread terminations are not communicated to analysis layer.
 * All serialization is performed by a single thread. This thread can bottleneck the outgoing data.
 * Obtaining the backtrace is slow. It gets slightly faster once all symbols have been resolved.
+* The `analyze` tool is a work in progress. The tracking allocator streams data correctly, but the
+  differential-dataflow analysis does not yet emit results reliably: the worker can stall while
+  arranging incoming batches, so the web visualization may not update. See the diagnosis in the
+  pull request for details.
