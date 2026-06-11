@@ -123,21 +123,29 @@ impl Trace {
 
     /// Fill a trace from the current call stack.
     pub fn fill(&mut self, skip: usize) {
-        let data = &mut self.data;
-        data.fill(0 as _);
-        let size =
-            unsafe { libunwind_sys::unw_backtrace(self.data.as_mut_ptr(), TRACE_MAX_SIZE as _) };
-        if size < 0 {
-            self.size = 0;
-            self.skip = 0;
-        } else {
-            let mut size = size as usize;
-            while size > 0 && self.data[size - 1].is_null() {
-                size -= 1;
+        self.data.fill(std::ptr::null_mut());
+        let mut size = 0;
+        {
+            let data = &mut self.data;
+            // `trace_unsynchronized` walks the stack via the platform unwinder without taking any
+            // locks, which is what we need on the allocation hot path. Re-entrant allocations are
+            // already guarded against by the borrow check in `AllocationWriter::writer`.
+            unsafe {
+                backtrace::trace_unsynchronized(|frame| {
+                    if size >= TRACE_MAX_SIZE {
+                        return false;
+                    }
+                    data[size] = frame.ip() as *mut c_void;
+                    size += 1;
+                    true
+                });
             }
-            self.size = size.saturating_sub(skip);
-            self.skip = skip;
         }
+        while size > 0 && self.data[size - 1].is_null() {
+            size -= 1;
+        }
+        self.size = size.saturating_sub(skip);
+        self.skip = skip;
     }
 }
 

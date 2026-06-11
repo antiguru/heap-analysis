@@ -18,7 +18,6 @@ use crossbeam_channel::{
 
 use lazy_static::lazy_static;
 use libc::c_void;
-use retain_mut::RetainMut;
 
 use track_types::{
     CreateThread, DestroyThread, InstrAllocation, InstrStack, InstrStackDetails, StackInfo,
@@ -69,6 +68,20 @@ lazy_static! {
 
 /// Is tracking enabled?
 static ENABLE_TRACKING: AtomicBool = AtomicBool::new(false);
+
+/// Name prefix for internal helper threads (gatherer, resolver).
+///
+/// Threads whose name starts with this prefix never track their own allocations. This must be
+/// applied before a thread is spawned because the runtime allocates while bootstrapping a thread,
+/// before the thread body has a chance to disable tracking.
+const INTERNAL_THREAD_PREFIX: &str = "HA-";
+
+/// Returns `true` if the current thread is an internal helper thread that must not be tracked.
+fn is_internal_thread() -> bool {
+    std::thread::current()
+        .name()
+        .map_or(false, |name| name.starts_with(INTERNAL_THREAD_PREFIX))
+}
 
 /// Monotonically-increasing thread counter to assign thread IDs
 static THREAD_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -159,7 +172,7 @@ impl GatherHandle {
         let connection = BufWriter::new(stream);
 
         let handle = std::thread::Builder::new()
-            .name("HA-gather".to_owned())
+            .name(format!("{INTERNAL_THREAD_PREFIX}gather"))
             .spawn(|| {
                 // Disable tracking for this thread
                 AllocationWriter::WRITER.with(|x| *x.borrow_mut() = TrackingState::Disabled);
@@ -174,7 +187,7 @@ impl GatherHandle {
             })?;
 
         let resolv_handle = std::thread::Builder::new()
-            .name("HA-resolv".to_owned())
+            .name(format!("{INTERNAL_THREAD_PREFIX}resolv"))
             .spawn(|| {
                 // Disable tracking for this thread
                 AllocationWriter::WRITER.with(|x| *x.borrow_mut() = TrackingState::Disabled);
@@ -583,9 +596,20 @@ impl AllocationWriter {
             // Try to borrow. Prevents re-entrant allocations and allocations after dropping
             if let Ok(mut borrow) = x.try_borrow_mut() {
                 if matches!(*borrow, TrackingState::None) {
-                    let mut inner = AllocationWriter::new(GATHER.lock().unwrap().clone().unwrap());
-                    inner.init();
-                    *borrow = TrackingState::Ready(inner);
+                    // The gatherer and resolver threads must never track their own allocations.
+                    // The Rust runtime performs allocations while bootstrapping a thread, *before*
+                    // the thread body runs and can mark its state as `Disabled`. If such an
+                    // allocation were tracked, the helper thread would try to register itself with
+                    // the gatherer and deadlock waiting for itself. Detect these threads by their
+                    // name, which is set before the thread starts, and disable tracking for them.
+                    if is_internal_thread() {
+                        *borrow = TrackingState::Disabled;
+                    } else {
+                        let mut inner =
+                            AllocationWriter::new(GATHER.lock().unwrap().clone().unwrap());
+                        inner.init();
+                        *borrow = TrackingState::Ready(inner);
+                    }
                 }
                 if let TrackingState::Ready(inner) = &mut *borrow {
                     f(inner);
