@@ -27,4 +27,7 @@ fn main() {
         });
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
+
+    // Flush all tracked allocations and close the connection to the analysis tool before exiting.
+    ALLOC.stop();
 }

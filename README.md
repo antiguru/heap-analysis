@@ -15,8 +15,13 @@ static ALLOC: heap_analysis_track::TrackingAllocator<std::alloc::System> = heap_
 fn main() {
     ALLOC.start();
     // Rest of application
+    ALLOC.stop();
 }
 ```
+
+Call `ALLOC.stop()` near the end of `main` to flush all buffered allocation data and close the
+connection to the analysis tool. Without it, the program's exit discards any unsent data and leaves
+the connection half-open.
 
 By default, the allocator streams its data to `localhost:64123`. This address can be configured with the environment
 symbol `HEAP_ANALYSIS_ADDR`.
@@ -33,11 +38,13 @@ symbol `HEAP_ANALYSIS_ADDR`.
    ```
 3. Observe the output of the `analyze` program.
 
+The `analyze` program serves a web UI on `localhost:8088` and streams results (per-thread-pair
+allocation totals and detected allocation errors) to connected clients over a WebSocket at `/ws`.
+
 ## Limitations
 
 * All serialization is performed by a single thread. This thread can bottleneck the outgoing data.
 * Obtaining the backtrace is slow. It gets slightly faster once all symbols have been resolved.
-* The `analyze` tool is a work in progress. The tracking allocator streams data correctly, but the
-  differential-dataflow analysis does not yet emit results reliably: the worker can stall while
-  arranging incoming batches, so the web visualization may not update. See the diagnosis in the
-  pull request for details.
+* Pointer matching processes events in arrival order rather than strict global time order, so
+  allocations and deallocations that interleave across threads can be reported as spurious
+  double-frees, double-allocations, or leaks.

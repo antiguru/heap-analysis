@@ -1,36 +1,33 @@
 use crate::{AllocError, AllocPerThreadPair, OutputData};
 use bincode::Options;
-use core::default::Default;
-use core::hash::Hash;
-use core::option::Option::{None, Some};
-use core::result::Result;
-use core::result::Result::{Err, Ok};
 use core::time::Duration;
 use crossbeam_channel::{bounded, TryRecvError};
-use differential_dataflow::difference::DiffPair;
-use differential_dataflow::operators::arrange::arrangement::Arrange;
-use differential_dataflow::operators::arrange::ArrangeBySelf;
-use differential_dataflow::trace::implementations::ord::OrdValSpine;
-use differential_dataflow::trace::{BatchReader, Cursor};
-use differential_dataflow::AsCollection;
 use std::collections::HashMap;
-use std::hash::Hasher;
+use std::hash::{Hash, Hasher};
 use std::io::BufReader;
 use std::net::TcpListener;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use timely::communication::allocator::Generic;
+
+use differential_dataflow::collection::AsCollection;
+
 use timely::communication::WorkerGuards;
 use timely::dataflow::channels::pact::{Exchange, Pipeline};
-use timely::dataflow::operators::capture::event::Event;
-use timely::dataflow::operators::generic::builder_rc::OperatorBuilder;
-use timely::dataflow::operators::generic::operator::source;
-use timely::dataflow::operators::{Capture, Concatenate, Exchange as ExchangeOp, Map, Operator};
-use timely::dataflow::scopes::child::Child;
-use timely::scheduling::Scheduler;
+use timely::dataflow::operators::capture::{Capture, Event};
+use timely::dataflow::operators::generic::{source, Operator};
+use timely::dataflow::operators::vec::map::Map;
+use timely::dataflow::operators::{Concatenate, Exchange as ExchangeOp};
 use timely::worker::Worker;
-use track_types::{Timestamp, TraceIndex, TraceInstruction, TraceProtocol, ENV_HEAP_ANALYSIS_ADDR};
+use track_types::{TraceIndex, TraceInstruction, TraceProtocol, ENV_HEAP_ANALYSIS_ADDR};
+
+/// Width of the aggregation time window, in nanoseconds.
+const ROUND_TO: u64 = Duration::from_millis(10_000).as_nanos() as u64;
+
+/// Round a timestamp up to the next multiple of [`ROUND_TO`].
+fn round_up(time: u64) -> u64 {
+    time.div_ceil(ROUND_TO).saturating_mul(ROUND_TO)
+}
 
 fn fnv_hash<H: Hash>(value: &H) -> u64 {
     let mut hasher = fnv::FnvHasher::default();
@@ -38,19 +35,38 @@ fn fnv_hash<H: Hash>(value: &H) -> u64 {
     hasher.finish()
 }
 
-const ROUND_TO: u64 = Duration::from_millis(10000).as_nanos() as u64;
+/// Allocation metadata: the time, thread, and stack trace of an allocation event.
+type AllocInfo = (u64, usize, TraceIndex);
 
+/// Internal event produced by the pointer-matching operator.
+#[derive(Clone, Debug)]
+enum MatchEvent {
+    /// A deallocation matched to its allocation.
+    Pair {
+        alloc_thread: usize,
+        dealloc_thread: usize,
+        /// Time window (rounded) the deallocation falls into.
+        bucket: u64,
+        size: isize,
+    },
+    /// An error observed while matching.
+    Error(AllocError),
+}
+
+/// Construct the analysis dataflow.
+///
+/// Returns a receiver of captured output events and the join handle of the worker thread.
 pub fn construct_dataflow() -> (
-    Receiver<Event<u64, OutputData>>,
+    Receiver<Event<u64, Vec<OutputData>>>,
     JoinHandle<Result<WorkerGuards<()>, String>>,
 ) {
     let output = Arc::new(Mutex::new(None));
     let output2 = Arc::clone(&output);
     let thread = std::thread::spawn(|| {
         timely::execute_from_args(std::env::args(), move |worker| {
-            let output = construct_dataflow_inner(worker);
+            let receiver = construct_dataflow_inner(worker);
             if worker.index() == 0 {
-                *output2.lock().unwrap() = Some(output);
+                *output2.lock().unwrap() = Some(receiver);
             }
 
             while worker.step_or_park(None) {
@@ -59,7 +75,6 @@ pub fn construct_dataflow() -> (
         })
     });
     loop {
-        // println!("taking receiver");
         if let Some(receiver) = output.lock().unwrap().take() {
             return (receiver, thread);
         }
@@ -67,12 +82,16 @@ pub fn construct_dataflow() -> (
     }
 }
 
-fn construct_dataflow_inner(worker: &mut Worker<Generic>) -> Receiver<Event<u64, OutputData>> {
+fn construct_dataflow_inner(worker: &mut Worker) -> Receiver<Event<u64, Vec<OutputData>>> {
     worker.dataflow::<u64, _, _>(|scope| {
         let index = scope.index();
+
+        // ---- Source: read the trace protocol from a worker-0-hosted TCP socket. ----
+        // Emits `(event_time, thread_id, instruction)` triples at a timely time equal to the
+        // protocol's message timestamp.
         let trace = source(scope, "Trace reader", |cap, info| {
             let mut state = if index == 0 {
-                let activator = scope.sync_activator_for(&info.address[..]);
+                let sync_activator = scope.worker().sync_activator_for(info.address.to_vec());
                 let (sender, receiver) = bounded(64);
 
                 std::thread::Builder::new()
@@ -89,8 +108,10 @@ fn construct_dataflow_inner(worker: &mut Worker<Generic>) -> Receiver<Event<u64,
                                 .deserialize_from::<_, TraceProtocol>(&mut stream)
                             {
                                 Ok(data) => {
-                                    sender.send(data).unwrap();
-                                    activator.activate().unwrap();
+                                    if sender.send(data).is_err() {
+                                        break;
+                                    }
+                                    let _ = sync_activator.activate();
                                 }
                                 Err(err) => {
                                     eprintln!("Exiting reader thread: {:?}", err);
@@ -98,8 +119,10 @@ fn construct_dataflow_inner(worker: &mut Worker<Generic>) -> Receiver<Event<u64,
                                 }
                             }
                         }
-                        std::mem::drop(sender);
-                        activator.activate().unwrap();
+                        // Close the channel and wake the worker so the source observes the
+                        // disconnect and closes out its capability.
+                        drop(sender);
+                        let _ = sync_activator.activate();
                     })
                     .unwrap();
                 Some((cap, receiver))
@@ -107,11 +130,11 @@ fn construct_dataflow_inner(worker: &mut Worker<Generic>) -> Receiver<Event<u64,
                 None
             };
 
-            let activator = scope.activator_for(&info.address[..]);
+            let activator = scope.activator_for(info.address.clone());
             move |output| {
                 let mut exit = false;
                 if let Some((cap, receiver)) = state.as_mut() {
-                    let mut fuel = 16;
+                    let mut fuel = 256;
                     while fuel > 0 && !exit {
                         fuel -= 1;
                         match receiver.try_recv() {
@@ -120,30 +143,38 @@ fn construct_dataflow_inner(worker: &mut Worker<Generic>) -> Receiver<Event<u64,
                                 thread_id,
                                 mut buffer,
                             }) => {
-                                if *cap.time() != timestamp {
+                                if *cap.time() < timestamp {
                                     cap.downgrade(&timestamp);
                                 }
-                                let mut data = buffer
-                                    .drain(..)
-                                    .map(|(data, time)| (time, (thread_id, data)))
-                                    .collect();
-                                output.session(&cap).give_vec(&mut data);
+                                let mut session = output.session(&*cap);
+                                for (instr, time) in buffer.drain(..) {
+                                    session.give((time, thread_id, instr));
+                                }
                             }
-                            Ok(TraceProtocol::CreateThread(_info)) => {}
-                            Ok(TraceProtocol::DestroyThread(_info)) => {}
-                            Ok(TraceProtocol::Stack(_timestamp, _infos)) => {}
                             Ok(TraceProtocol::Timestamp(timestamp)) => {
-                                cap.downgrade(&timestamp);
+                                if *cap.time() < timestamp {
+                                    cap.downgrade(&timestamp);
+                                }
                             }
+                            Ok(TraceProtocol::CreateThread(_))
+                            | Ok(TraceProtocol::DestroyThread(_))
+                            | Ok(TraceProtocol::Stack(_, _)) => {}
                             Err(TryRecvError::Disconnected) => {
                                 exit = true;
-                                break;
                             }
                             Err(TryRecvError::Empty) => break,
                         }
                     }
                     if fuel == 0 {
+                        // Drained a full batch; more data is likely pending, so reschedule now.
                         activator.activate();
+                    } else if !exit {
+                        // The channel ran dry. Keep polling it ourselves rather than rely solely
+                        // on the reader thread: the reader can block on a full bounded channel
+                        // before reaching its `activate()` call, and a worker that parks at that
+                        // moment would never be woken again. A short timed self-activation
+                        // guarantees we revisit the channel and observe new data or a disconnect.
+                        activator.activate_after(Duration::from_millis(10));
                     }
                 }
                 if exit {
@@ -151,148 +182,125 @@ fn construct_dataflow_inner(worker: &mut Worker<Generic>) -> Receiver<Event<u64,
                 }
             }
         });
-        let collection = trace
-            .flat_map(|(time, (thread_id, instr))| {
-                let diff: isize = match &instr {
-                    TraceInstruction::Stack(_) => 0,
-                    TraceInstruction::Allocate(_) => 1,
-                    TraceInstruction::Deallocate(_) => -1,
-                };
-                instr.ptr().map(|ptr| {
-                    (
-                        (ptr, (time, thread_id, instr.trace_index().unwrap())),
-                        time,
-                        DiffPair::new(diff, instr.size().unwrap() as isize * diff),
-                    )
-                })
-            })
-            .as_collection();
-        let arranged =
-            Arrange::<Child<_, u64>, _, (_, _, _), _>::arrange_core::<_, OrdValSpine<_, _, _, _>>(
-                &collection,
-                Exchange::new(|((ptr, _), _, _)| fnv_hash(ptr)),
-                "ptr arrange",
-            );
 
-        let (matched, err_stream) = {
-            let mut builder = OperatorBuilder::new("Match ptr".to_owned(), arranged.stream.scope());
-
-            let mut input = builder.new_input(&arranged.stream, Pipeline);
-            let (mut output, stream) = builder.new_output();
-            let (mut err_output, err_stream) = builder.new_output();
-
-            builder.build(move |mut capabilities| {
-                let mut cap = capabilities.pop().unwrap();
-                cap.downgrade(&Timestamp::MAX);
-                let mut cap = Some(cap);
-                let mut stash: HashMap<u64, (u64, usize, TraceIndex)> = Default::default();
-                move |frontiers| {
-                    let mut output_handle = output.activate();
-                    let mut err_output_handle = err_output.activate();
+        // ---- Match allocations to deallocations by pointer. ----
+        // A plain stateful operator, partitioned by pointer, keeps one stash entry per live
+        // allocation. Memory is therefore bounded by the number of outstanding allocations.
+        let matched = trace.unary_frontier(
+            Exchange::new(|(_time, _thread, instr): &(u64, usize, TraceInstruction)| {
+                instr.ptr().map(|ptr| fnv_hash(&ptr)).unwrap_or(0)
+            }),
+            "Match ptr",
+            |default_cap, _info| {
+                // Capability used to emit leaks once the input is exhausted. Advanced to the input
+                // frontier so it does not hold back downstream progress.
+                let mut leak_cap = Some(default_cap);
+                let mut stash: HashMap<u64, AllocInfo> = HashMap::new();
+                move |(input, frontier), output| {
                     input.for_each(|time, data| {
-                        let mut session = output_handle.session(&time);
-                        let mut err_session = err_output_handle.session(&time);
-                        for wrapper in data.iter() {
-                            let batch = &wrapper;
-                            let mut cursor = batch.cursor();
-                            while let Some(ptr) = cursor.get_key(batch) {
-                                while let Some(current) = cursor.get_val(batch) {
-                                    cursor.map_times(batch, |_time, diff| {
-                                        if diff.element1 > 0 {
-                                            let old = stash.insert(*ptr, *current);
-                                            if let Some(old) = old {
-                                                err_session.give(AllocError::DoubleAlloc {
-                                                    ptr: *ptr,
-                                                    old,
-                                                    new: *current,
-                                                });
-                                            }
-                                        } else {
-                                            match stash.remove(ptr) {
-                                                Some(alloc) => session
-                                                    .give((*ptr, (alloc, *current, *diff * -1))),
-                                                None => err_session.give(AllocError::DoubleFree {
-                                                    ptr: *ptr,
-                                                    info: *current,
-                                                }),
-                                            }
-                                        }
-                                    });
-                                    cursor.step_val(batch);
+                        let bucket = round_up(*time.time());
+                        let mut session = output.session(&time);
+                        for (event_time, thread, instr) in data.drain(..) {
+                            match instr {
+                                TraceInstruction::Allocate(alloc) => {
+                                    let info = (event_time, thread, alloc.trace_index);
+                                    if let Some(old) = stash.insert(alloc.ptr, info) {
+                                        session.give(MatchEvent::Error(AllocError::DoubleAlloc {
+                                            ptr: alloc.ptr,
+                                            old,
+                                            new: info,
+                                        }));
+                                    }
                                 }
-                                cursor.step_key(batch);
+                                TraceInstruction::Deallocate(dealloc) => {
+                                    match stash.remove(&dealloc.ptr) {
+                                        Some(alloc) => session.give(MatchEvent::Pair {
+                                            alloc_thread: alloc.1,
+                                            dealloc_thread: thread,
+                                            bucket,
+                                            size: dealloc.size as isize,
+                                        }),
+                                        None => {
+                                            session.give(MatchEvent::Error(AllocError::DoubleFree {
+                                                ptr: dealloc.ptr,
+                                                info: (event_time, thread, dealloc.trace_index),
+                                            }))
+                                        }
+                                    }
+                                }
+                                TraceInstruction::Stack(_) => {}
                             }
                         }
                     });
-                    if frontiers[0].is_empty() {
-                        if let Some(cap) = cap.take() {
-                            let mut err_session = err_output_handle.session(&cap);
-                            for (ptr, data) in stash.drain() {
-                                err_session.give(AllocError::DoubleFree { ptr, info: data })
+
+                    let frontier = frontier.frontier();
+                    if frontier.is_empty() {
+                        // Input exhausted: everything still outstanding is a leak.
+                        if let Some(cap) = leak_cap.take() {
+                            let mut session = output.session(&cap);
+                            for (ptr, info) in stash.drain() {
+                                session.give(MatchEvent::Error(AllocError::Leak { ptr, info }));
                             }
                         }
-                    }
-                }
-            });
-            (stream, err_stream)
-        };
-        let alloc_per_thread_pair = matched
-            // .inspect(|(ptr, (alloc, dealloc, size))| {
-            //     println!(
-            //         "ptr: {:x}, {:?} -> {:?}, size: {}",
-            //         ptr, alloc, dealloc, size,
-            //     );
-            // });
-            .map(|(_ptr, (alloc, dealloc, count_size))| {
-                (
-                    ((alloc.1, dealloc.1), ()),
-                    (dealloc.0 + ROUND_TO - 1) / ROUND_TO * ROUND_TO,
-                    count_size,
-                )
-            })
-            .as_collection()
-            .arrange_by_self()
-            .as_collection(|k, _| k.0);
-        // alloc_per_thread_pair.inspect(|(k, t, d)| println!("k: {:?}, t: {}, d: {}", k, t, d));
-        let alloc_per_thread_pair = alloc_per_thread_pair.inner.unary_notify(
-            Exchange::new(|_| 0),
-            "group_by_time",
-            None,
-            {
-                let mut stash: HashMap<Timestamp, Vec<_>> = Default::default();
-                let mut buffer = Default::default();
-                move |input, output, not| {
-                    while let Some((time, data)) = input.next() {
-                        data.swap(&mut buffer);
-                        stash
-                            .entry(*time.time())
-                            .or_default()
-                            .extend(buffer.drain(..).map(|((t1, t2), _, count_size)| {
-                                AllocPerThreadPair {
-                                    alloc_thread: t1,
-                                    dealloc_thread: t2,
-                                    count: count_size.element1,
-                                    size: count_size.element2,
-                                }
-                            }));
-                        not.notify_at(time.retain());
-                    }
-                    not.for_each(|time, _cnt, _not| {
-                        if let Some(data) = stash.remove(time.time()) {
-                            output
-                                .session(&time)
-                                .give(OutputData::AllocPerThreadPairs(data));
+                    } else if let (Some(cap), Some(time)) = (leak_cap.as_mut(), frontier.first()) {
+                        if cap.time() < time {
+                            cap.downgrade(time);
                         }
-                    })
+                    }
                 }
             },
         );
-        // err_stream.inspect(|err| println!("Err: {:?}", err));
+
+        // ---- Errors are emitted directly. ----
+        let errors = matched.clone().flat_map(|event| match event {
+            MatchEvent::Error(error) => Some(OutputData::AllocError(error)),
+            MatchEvent::Pair { .. } => None,
+        });
+
+        // ---- Matched pairs are aggregated per (alloc_thread, dealloc_thread) and time window. ----
+        // The differential timestamp is the (low-cardinality) rounded window, so the arrangement
+        // backing `consolidate` stays small.
+        let pairs = matched
+            .flat_map(|event| match event {
+                MatchEvent::Pair {
+                    alloc_thread,
+                    dealloc_thread,
+                    bucket,
+                    size,
+                } => Some(((alloc_thread, dealloc_thread), bucket, (1isize, size))),
+                MatchEvent::Error(_) => None,
+            })
+            .as_collection()
+            .consolidate()
+            .inner
+            .unary_notify(Pipeline, "group_by_window", None, {
+                let mut stash: HashMap<u64, Vec<AllocPerThreadPair>> = HashMap::new();
+                move |input, output, notificator| {
+                    input.for_each(|time, data| {
+                        for ((alloc_thread, dealloc_thread), _window, (count, size)) in data.drain(..)
+                        {
+                            stash.entry(*time.time()).or_default().push(AllocPerThreadPair {
+                                alloc_thread,
+                                dealloc_thread,
+                                count,
+                                size,
+                            });
+                        }
+                        notificator.notify_at(time.retain(output.output_index()));
+                    });
+                    notificator.for_each(|time, _cnt, _not| {
+                        if let Some(pairs) = stash.remove(time.time()) {
+                            output
+                                .session(&time)
+                                .give(OutputData::AllocPerThreadPairs(pairs));
+                        }
+                    });
+                }
+            });
+
+        // ---- Merge both output streams onto worker 0 and capture them. ----
         scope
-            .concatenate([
-                err_stream.map(OutputData::AllocError),
-                alloc_per_thread_pair,
-            ])
+            .concatenate(vec![errors, pairs])
             .exchange(|_| 0)
             .capture()
     })
