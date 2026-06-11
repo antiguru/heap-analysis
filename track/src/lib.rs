@@ -57,6 +57,21 @@ impl<A> TrackingAllocator<A> {
             }
         }
     }
+
+    /// Stop tracking memory allocations and flush all pending data.
+    ///
+    /// Should be called near the end of `main`, before the program exits. It disables further
+    /// tracking, asks the gatherer to flush every outstanding buffer and close the connection to
+    /// the analysis side, and waits for that to complete. Without this call the program's abrupt
+    /// exit would discard buffered allocation data and leave the connection half-open, since the
+    /// global gatherer handle lives in a `static` whose destructor never runs.
+    pub fn stop(&self) {
+        ENABLE_TRACKING.store(false, Ordering::SeqCst);
+        let handle = GATHER.lock().unwrap().take();
+        if let Some(handle) = handle {
+            handle.shutdown();
+        }
+    }
 }
 
 lazy_static! {
@@ -153,6 +168,8 @@ struct GatherHandle {
     data_sender: Option<Sender<FlushBuffer>>,
     /// Send endpoint to provide data
     register_sender: Option<Sender<Register>>,
+    /// Send endpoint to request a graceful shutdown of the gatherer
+    shutdown_sender: Option<Sender<()>>,
     /// shared join handle to wait for termination of the gatherer
     handle: Arc<Mutex<Option<[JoinHandle<()>; 2]>>>,
 }
@@ -161,6 +178,7 @@ impl GatherHandle {
     fn new() -> Result<Self, std::io::Error> {
         let (data_sender, data_receiver) = bounded(64);
         let (registration_sender, registration_receiver) = unbounded();
+        let (shutdown_sender, shutdown_receiver) = bounded(1);
 
         let (to_resolv_sender, to_resolv_receiver) = unbounded();
         let (resolved_sender, resolved_receiver) = bounded(64);
@@ -179,6 +197,7 @@ impl GatherHandle {
                 let mut gatherer = Gatherer::new(
                     data_receiver,
                     registration_receiver,
+                    shutdown_receiver,
                     connection,
                     to_resolv_sender,
                     resolved_receiver,
@@ -198,6 +217,7 @@ impl GatherHandle {
         Ok(Self {
             data_sender: Some(data_sender),
             register_sender: Some(registration_sender),
+            shutdown_sender: Some(shutdown_sender),
             handle: Arc::new(Mutex::new(Some([handle, resolv_handle]))),
         })
     }
@@ -234,6 +254,26 @@ impl GatherHandle {
             .send(FlushBuffer { thread_id, buffer })
             .unwrap();
     }
+
+    /// Request a graceful shutdown of the gatherer and wait for it to terminate.
+    ///
+    /// This signals the gatherer thread to perform a final flush of all outstanding buffers and
+    /// close the connection, then joins the gatherer and resolver threads. Joining ensures the
+    /// final flush has completed and the connection has been closed (signalling EOF to the
+    /// analysis side) before returning.
+    fn shutdown(&self) {
+        if let Some(sender) = self.shutdown_sender.as_ref() {
+            // A failure here means the gatherer already exited; nothing left to do.
+            let _ = sender.send(());
+        }
+        if let Ok(mut guard) = self.handle.lock() {
+            if let Some(handles) = guard.take() {
+                for handle in handles {
+                    let _ = handle.join();
+                }
+            }
+        }
+    }
 }
 
 impl Drop for GatherHandle {
@@ -269,6 +309,8 @@ struct Gatherer {
     data_receiver: Receiver<FlushBuffer>,
     /// Receive endpoint for registering new threads.
     registration_receiver: Receiver<Register>,
+    /// Receive endpoint signalling a graceful shutdown request.
+    shutdown_receiver: Receiver<()>,
     /// Sink to write data
     connection: BufWriter<TcpStream>,
     /// Sender to resolv thread.
@@ -295,6 +337,7 @@ impl Gatherer {
     fn new(
         data_receiver: Receiver<FlushBuffer>,
         registration_receiver: Receiver<Register>,
+        shutdown_receiver: Receiver<()>,
         connection: BufWriter<TcpStream>,
         to_resolv_sender: Sender<ResolverProtocol>,
         resolved_receiver: Receiver<(Timestamp, StackInfo)>,
@@ -302,6 +345,7 @@ impl Gatherer {
         Self {
             data_receiver,
             registration_receiver,
+            shutdown_receiver,
             connection,
             to_resolv_sender,
             resolved_receiver,
@@ -333,6 +377,11 @@ impl Gatherer {
                         Err(_) => break,
                     }
                 },
+                recv(self.shutdown_receiver) -> _ => {
+                    // Explicit shutdown request: stop the run loop. The `Drop` impl performs the
+                    // final flush and closes the connection.
+                    break;
+                },
                 recv(self.resolved_receiver) -> msg => {
                     match msg {
                         Ok((timestamp, details)) => self.handle_details(timestamp, details),
@@ -350,6 +399,16 @@ impl Gatherer {
             .unwrap();
         while let Ok((timestamp, details)) = self.resolved_receiver.recv() {
             self.handle_details(timestamp, details)
+        }
+        // Flush any stack details that did not fill a complete batch.
+        if !self.stack_details_buffer.is_empty() {
+            let buffer = std::mem::take(&mut self.stack_details_buffer);
+            Self::bincode()
+                .serialize_into::<_, TraceProtocol>(
+                    &mut self.connection,
+                    &TraceProtocol::Stack(buffer[0].0, buffer),
+                )
+                .unwrap();
         }
         self.connection.flush().unwrap();
     }

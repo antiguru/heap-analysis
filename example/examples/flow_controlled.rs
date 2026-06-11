@@ -44,4 +44,7 @@ fn main() {
         });
     })
     .unwrap();
+
+    // Flush all tracked allocations and close the connection to the analysis tool before exiting.
+    ALLOC.stop();
 }

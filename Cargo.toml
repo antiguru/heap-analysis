@@ -1,4 +1,5 @@
 [workspace]
+resolver = "2"
 members = ["analyze", "example", "track", "track-types"]
 
 [profile.release]
